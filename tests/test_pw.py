@@ -81,6 +81,16 @@ FIXTURE_HTML = textwrap.dedent("""\
 FIXTURE_PATH = "/tmp/pw-test-fixture.html"
 
 
+# Pin every subprocess pw call to a single named session so the tabs we
+# open during testing all live in one trackable place. Naming this `SESSION`
+# (as opposed to a private constant) opts into the per-test cleanup fixture
+# in conftest.py — `pw close --name pytest-test-pw` runs after every test,
+# closing the tab and removing the state file. Leftover-detection by glob
+# still runs at session end as a belt-and-braces backstop.
+SESSION = "pytest-test-pw"
+PYTEST_SESSION = SESSION  # readability alias used elsewhere in this file
+
+
 def run_pw(*args, timeout=30):
     """Run pw CLI as a subprocess, return (exit_code, stdout, stderr)."""
     result = subprocess.run(
@@ -91,6 +101,7 @@ def run_pw(*args, timeout=30):
         env={
             **os.environ,
             "NODE_NO_WARNINGS": "1",
+            "PW_SESSION": PYTEST_SESSION,
         },
     )
     return result.returncode, result.stdout, result.stderr
@@ -208,8 +219,11 @@ class TestCliDispatch:
     def test_close_runs(self):
         code, out, err = run_pw("close")
         assert code == 0
-        # Safari may be running (returns "cleaned") or not (returns "not running")
-        assert "cleaned" in out.lower() or "not running" in out.lower()
+        # `pw close` either scrubs unnamed state ("cleaned"), reports nothing
+        # to do ("not running"), or, when PW_SESSION points at a named session
+        # (as the test suite sets it), reports "closed".
+        out_l = out.lower()
+        assert "cleaned" in out_l or "not running" in out_l or "closed" in out_l
 
 
 class TestCommandsDict:
@@ -781,17 +795,15 @@ class TestNamedSessions:
         state = json.loads(open(path).read())
         assert state["session_id"].startswith("pw_")
         assert "example.com" in state["url"]
-        # Cleanup
-        os.unlink(path)
+        # Cleanup: close the tab AND remove state (unlink alone leaks tabs).
+        _run_safari("close", "--name", "test-session-1")
 
     def test_named_session_injects_marker(self, safari_browser):
         _run_safari("nav", "https://example.com", "--name", "test-marker", "--quiet")
         code, val, _ = _run_safari("eval", "window.__pw_session_id", "--name", "test-marker")
         assert val.strip().startswith("pw_")
         # Cleanup
-        path = os.path.join(pw.STATE_DIR, "session-test-marker.json")
-        if os.path.exists(path):
-            os.unlink(path)
+        _run_safari("close", "--name", "test-marker")
 
     def test_env_var_session(self, safari_browser):
         """PW_SESSION env var should work like --name."""
@@ -804,7 +816,7 @@ class TestNamedSessions:
         path = os.path.join(pw.STATE_DIR, "session-test-env-session.json")
         assert os.path.exists(path)
         # Cleanup
-        os.unlink(path)
+        _run_safari("close", "--name", "test-env-session")
 
 
 @pytest.mark.safari

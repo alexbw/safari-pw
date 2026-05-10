@@ -1,0 +1,2447 @@
+#!/usr/bin/env python3
+"""
+pw — Safari-only browser automation CLI for Claude Code.
+
+Controls Safari via JXA (JavaScript for Automation) in the BACKGROUND --
+Safari does not need to be in the foreground. Supports macOS Keychain
+password autofill and Touch ID. For Chromium automation, use the
+Playwright MCP plugin instead.
+
+Usage:
+    pw launch                         Start Safari
+    pw nav URL                        Navigate to URL, print title
+    pw click SELECTOR                 Click an element (CSS or text=...)
+    pw fill SELECTOR TEXT             Fill an input field
+    pw type TEXT                      Type text into the focused element
+    pw press KEY                      Press a key (Enter, Tab, Escape, etc.)
+    pw select SEL VALUE               Select an option from a dropdown
+    pw screenshot [PATH]              Screenshot to PATH (default /tmp/pw-screenshot.png)
+    pw snap                           Fast page state: title + URL + text (one call)
+    pw text [SELECTOR]                Get visible text (full page or selector)
+    pw html [SELECTOR]                Get innerHTML (full page or selector)
+    pw eval JS                        Evaluate JavaScript, print result
+    pw title                          Print page title
+    pw url                            Print current URL
+    pw links [SELECTOR]               List links (text + href) on the page or in selector
+    pw wait SELECTOR                  Wait for selector to appear (up to 10s)
+    pw tabs                           List open tabs
+    pw tab INDEX                      Switch to tab by index
+    pw back                           Navigate back
+    pw close                          Close the browser
+    pw status                         Check if browser is running
+    pw doctor                         Check Safari setup (permissions, settings)
+    pw batch "CMD1" "CMD2" ...        Run multiple commands in one connection (faster)
+    pw react-click SELECTOR           Click via React fiber (background-safe, for MUI/React)
+    pw react-set SEL PROP VALUE       Set React component value via handler (e.g. onChange)
+
+Output flags (nav, click, back auto-include page text by default):
+    pw nav URL                        Navigate + auto-print page text
+    pw nav URL --links [SEL]          Navigate + print links instead
+    pw nav URL --html [SEL]           Navigate + print HTML instead
+    pw nav URL --quiet                Navigate only, no page text
+    pw click SEL                      Click + auto-print page text
+    pw click SEL --links              Click + print links instead
+    pw click SEL --html [SEL2]        Click + print HTML instead
+    pw click SEL --quiet              Click only, no page text
+    pw back                           Back + auto-print page text
+    pw back --quiet                   Back only, no page text
+
+Named sessions: Use --name SESSION or set PW_SESSION env var for multi-agent use.
+    Each session tracks its own tab independently. Example:
+        pw nav https://site-a.com --name agent1
+        pw nav https://site-b.com --name agent2
+        pw click "#btn" --name agent1     # targets site-a tab
+        pw fill "#input" "text" --name agent2  # targets site-b tab
+
+Safari setup (one-time):
+    1. Safari > Settings > Advanced > check "Show features for web developers"
+    2. Safari > Settings > Developer > check "Allow JavaScript from Apple Events"
+    3. First run: approve "Terminal wants to control Safari" dialog
+
+Note: react-click and react-set find React fiber internals on DOM elements
+and invoke component handlers directly, bypassing the DOM event system.
+This works for MUI, React, and similar frameworks entirely in the background.
+
+Background mode: type/press/screenshot run fully in the background by default
+(Safari stays where it is). type/press use synthetic KeyboardEvents
+(isTrusted=false). If a site ignores those (rare — most do not), set
+PW_KEYSTROKE=1 to force OS-level keystrokes via System Events; that path
+activates Safari and requires Accessibility permission.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+from json import dumps as _json_escape
+
+SCREENSHOT_DEFAULT = "/tmp/pw-screenshot.png"
+
+# --- Safari state ---
+# State lives under the user's Application Support dir (mode 0700),
+# not /tmp, so other local users can't read session URLs / IDs and can't
+# pre-create symlinks at predictable paths to clobber unrelated files.
+STATE_DIR = os.path.join(
+    os.path.expanduser("~"), "Library", "Application Support", "safari-pw"
+)
+SAFARI_TAB_FILE = os.path.join(STATE_DIR, "default.json")
+
+# --- Session management ---
+_session_name = None  # set by --name flag
+_session_counter = 0  # monotonic counter for unique session IDs
+
+
+def _ensure_state_dir():
+    """Create the per-user state dir with mode 0700 if missing."""
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        # If the dir already existed with looser perms, tighten it.
+        try:
+            os.chmod(STATE_DIR, 0o700)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+_SAFE_SESSION_RE = None  # lazy-compiled in _safe_session_name
+
+
+def _safe_session_name(name):
+    """Validate a --name / PW_SESSION value. Reject anything that could escape
+    the state dir or collide via path traversal. Allowed: [A-Za-z0-9._-], 1-64 chars."""
+    global _SAFE_SESSION_RE
+    if _SAFE_SESSION_RE is None:
+        import re
+        _SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+    if not _SAFE_SESSION_RE.match(name) or name in (".", "..") or name.startswith("."):
+        raise PwError(
+            f"Invalid session name {name!r}: must match [A-Za-z0-9._-]{{1,64}} "
+            "and cannot start with '.' or be '.'/'..'."
+        )
+    return name
+
+# ============================================================
+# React fiber helper JS (shared across click, react-click, react-set, fill)
+# ============================================================
+
+REACT_FIBER_JS = (
+    "function __pw_getReactFiber(el) {"
+    "  var key = Object.keys(el).find(function(k) {"
+    "    return k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$');"
+    "  });"
+    "  return key ? el[key] : null;"
+    "}"
+    "function __pw_findHandler(fiber, handlerName) {"
+    "  var current = fiber;"
+    "  while (current) {"
+    "    if (current.memoizedProps && current.memoizedProps[handlerName]) {"
+    "      return current.memoizedProps[handlerName];"
+    "    }"
+    "    current = current.return;"
+    "  }"
+    "  return null;"
+    "}"
+    "function __pw_makeSyntheticEvent(el, type) {"
+    "  return {"
+    "    target: el, currentTarget: el,"
+    "    preventDefault: function(){}, stopPropagation: function(){},"
+    "    nativeEvent: new MouseEvent(type || 'click'),"
+    "    type: type || 'click',"
+    "    bubbles: true, cancelable: true"
+    "  };"
+    "}"
+)
+
+
+class PwError(Exception):
+    """Raised for expected errors that should produce a clean error message."""
+    pass
+
+
+def _wrap_multi_statement_js(js):
+    """Wrap multi-statement JS in an IIFE so Safari JXA returns the last value.
+
+    Safari's doJavaScript only returns the value of the last expression.
+    Multi-statement code (var, try/catch, assignments) returns undefined/null.
+    This wraps such code in (function(){ ... })() with a return on the last statement.
+    """
+    js = js.strip()
+    # Already an IIFE — leave alone
+    if js.startswith("(function"):
+        return js
+    # Single expression (no semicolons outside strings) — leave alone
+    # Simple heuristic: if no ';' at all, it's a single expression
+    if ";" not in js and "\n" not in js:
+        return js
+    # Multi-statement: split on last semicolon/newline, add return before last expr
+    # Strip trailing semicolons/whitespace
+    while js.endswith(";") or js.endswith("\n"):
+        js = js.rstrip(";\n").rstrip()
+    # Find last statement boundary
+    lines = [l.strip() for l in js.replace(";", ";\n").split("\n") if l.strip()]
+    if not lines:
+        return js
+    last = lines[-1]
+    # Don't add return if last line already has return, or is a control structure
+    if not last.startswith("return ") and not last.startswith("if") and not last.startswith("for") and not last.startswith("while") and not last.startswith("try") and not last.startswith("}"):
+        lines[-1] = "return " + last
+    body = "; ".join(lines)
+    return f"(function(){{ {body} }})()"
+
+
+# ============================================================
+# Safari backend (JXA via osascript)
+# ============================================================
+
+MAC_KEY_CODES = {
+    "Enter": 36, "Return": 36, "Tab": 48, "Escape": 53, "Space": 49,
+    "Backspace": 51, "Delete": 117,
+    "ArrowUp": 126, "ArrowDown": 125, "ArrowLeft": 123, "ArrowRight": 124,
+    "Home": 115, "End": 119, "PageUp": 116, "PageDown": 121,
+    "F1": 122, "F2": 120, "F3": 99, "F4": 118, "F5": 96, "F6": 97,
+    "F7": 98, "F8": 100, "F9": 101, "F10": 109, "F11": 103, "F12": 111,
+    "a": 0, "b": 11, "c": 8, "d": 2, "e": 14, "f": 3, "g": 5, "h": 4,
+    "i": 34, "j": 38, "k": 40, "l": 37, "m": 46, "n": 45, "o": 31,
+    "p": 35, "q": 12, "r": 15, "s": 1, "t": 17, "u": 32, "v": 9,
+    "w": 13, "x": 7, "y": 16, "z": 6,
+}
+
+
+def _jxa(script, timeout=30):
+    """Execute a JXA script via osascript. Returns stdout."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript"],
+            input=script, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        raise PwError(f"JXA script timed out after {timeout}s")
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "not allowed to send keystrokes" in stderr.lower():
+            raise PwError(
+                "Accessibility permission required for type/press.\n"
+                "System Settings > Privacy & Security > Accessibility > enable your terminal"
+            )
+        if "apple events" in stderr.lower():
+            raise PwError(
+                "Safari setup required:\n"
+                "1. Safari > Settings > Advanced > 'Show features for web developers'\n"
+                "2. Safari > Settings > Developer > 'Allow JavaScript from Apple Events'"
+            )
+        if "(-600)" in stderr or "not running" in stderr.lower():
+            raise PwError("Safari is not running. Use: pw launch")
+        raise PwError(f"JXA error: {stderr}")
+    return result.stdout.strip()
+
+
+def _js_escape(s):
+    """Escape a string for safe embedding in JavaScript source."""
+    return json.dumps(s)
+
+
+def _build_tab_finder_jxa(session_id, hint_win=0, hint_tab=0):
+    """Return JXA code that sets __pw_win and __pw_tab by scanning for session marker.
+
+    Fast path: check the hinted window/tab indices first.
+    Slow path: scan all windows/tabs for the session marker.
+    Fallback: use hinted indices if no session_id or scan fails.
+
+    The returned code assumes `var safari = Application("Safari");` is already declared.
+    It declares __pw_win (window ref) and __pw_tab (tab ref).
+    """
+    if not session_id:
+        # No session tracking — use stored indices directly
+        return f'var __pw_win = safari.windows[{hint_win}]; var __pw_tab = __pw_win.tabs[{hint_tab}];'
+
+    escaped_sid = json.dumps(session_id)
+    return f'''
+    var __pw_win = null, __pw_tab = null;
+    // Fast path: check hinted indices first
+    try {{
+        var __hint_w = safari.windows[{hint_win}];
+        var __hint_t = __hint_w.tabs[{hint_tab}];
+        var __hint_sid = safari.doJavaScript("window.__pw_session_id || ''", {{in: __hint_t}});
+        if (__hint_sid === {escaped_sid}) {{
+            __pw_win = __hint_w;
+            __pw_tab = __hint_t;
+        }}
+    }} catch(e) {{}}
+    // Slow path: scan all windows/tabs
+    if (!__pw_tab) {{
+        for (var __fw = 0; __fw < safari.windows.length; __fw++) {{
+            for (var __ft = 0; __ft < safari.windows[__fw].tabs.length; __ft++) {{
+                try {{
+                    var __fsid = safari.doJavaScript("window.__pw_session_id || ''", {{in: safari.windows[__fw].tabs[__ft]}});
+                    if (__fsid === {escaped_sid}) {{
+                        __pw_win = safari.windows[__fw];
+                        __pw_tab = safari.windows[__fw].tabs[__ft];
+                        break;
+                    }}
+                }} catch(e) {{}}
+            }}
+            if (__pw_tab) break;
+        }}
+    }}
+    // Fallback: use hinted indices
+    if (!__pw_tab) {{
+        __pw_win = safari.windows[{hint_win}];
+        __pw_tab = __pw_win.tabs[{hint_tab}];
+    }}
+    '''
+
+
+def _translate_selector(selector):
+    """Translate text= selectors to JS querySelector expressions."""
+    if selector.startswith("text="):
+        text = selector[5:]
+        escaped = _js_escape(text)
+        # Find the innermost element whose textContent matches — excludes ancestors
+        return (
+            f'(function(){{'
+            f'var t={escaped};'
+            f'var all=Array.from(document.querySelectorAll("*")).filter(function(el){{return el.textContent.trim()===t}});'
+            f'return all.filter(function(el){{return !Array.from(el.children).some(function(c){{return c.textContent.trim()===t}})}})[0];'
+            f'}})()'
+        )
+    return f"document.querySelector({_js_escape(selector)})"
+
+
+class _SafariElement:
+    """Wrapper for Safari element interaction via JXA."""
+
+    def __init__(self, selector_js, tab_idx, window_idx=0, session_id=None):
+        self._sel = selector_js
+        self._tab = tab_idx
+        self._win = window_idx
+        self._session_id = session_id
+
+    def _exec(self, js):
+        escaped = json.dumps(js)
+        finder = _build_tab_finder_jxa(self._session_id, self._win, self._tab)
+        script = f'''
+        var safari = Application("Safari");
+        {finder}
+        safari.doJavaScript({escaped}, {{in: __pw_tab}});
+        '''
+        return _jxa(script)
+
+    def inner_text(self):
+        result = self._exec(f'(function(){{ var el={self._sel}; return el ? el.innerText : null; }})()')
+        if not result or result == "null":
+            raise PwError("Element has no text")
+        return result
+
+    def inner_html(self):
+        result = self._exec(f'(function(){{ var el={self._sel}; return el ? el.innerHTML.substring(0,100000) : null; }})()')
+        if not result or result == "null":
+            raise PwError("Element has no HTML")
+        return result
+
+
+class _SafariKeyboard:
+    """Safari keyboard interaction.
+
+    Default path runs JS in the pw tab — fully backgrounded, Safari stays put.
+    Set PW_KEYSTROKE=1 to force OS-level keystrokes via System Events; that
+    path activates Safari (it has to, since keystrokes route to the frontmost
+    app) and is only needed for sites that ignore synthetic KeyboardEvents.
+    """
+
+    def __init__(self, page=None):
+        self._page = page
+
+    def _use_keystroke(self):
+        return self._page is None or os.environ.get("PW_KEYSTROKE") == "1"
+
+    def type(self, text):
+        if self._use_keystroke():
+            self._type_keystroke(text)
+            return
+        # JS path: per-character keydown/keypress/insertText/keyup so
+        # type-as-you-search sites (autocomplete, Cmd-K palettes, etc.)
+        # see real-looking key events. Synthetic events have isTrusted=false;
+        # if the target site enforces isTrusted, set PW_KEYSTROKE=1.
+        escaped = _js_escape(text)
+        js = f'''(function(){{
+            var el = document.activeElement;
+            if (!el || el === document.body) {{
+                throw new Error("no focused element — call .click() or .focus() first, or set PW_KEYSTROKE=1");
+            }}
+            var text = {escaped};
+            var tag = (el.tagName || "").toUpperCase();
+            if (!(el.isContentEditable || tag === "INPUT" || tag === "TEXTAREA")) {{
+                throw new Error("focused element is not editable: " + tag);
+            }}
+            el.focus();
+            var nativeSetter = null;
+            if (tag === "INPUT" || tag === "TEXTAREA") {{
+                var proto = tag === "INPUT" ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+                var desc = Object.getOwnPropertyDescriptor(proto, "value");
+                nativeSetter = desc && desc.set;
+            }}
+            for (var i = 0; i < text.length; i++) {{
+                var ch = text[i];
+                var code = ch.charCodeAt(0);
+                var keyOpts = {{key: ch, code: "Key" + ch.toUpperCase(),
+                                keyCode: code, which: code,
+                                bubbles: true, cancelable: true}};
+                var dn = new KeyboardEvent("keydown", keyOpts);
+                var canceled = !el.dispatchEvent(dn);
+                el.dispatchEvent(new KeyboardEvent("keypress", keyOpts));
+                if (!canceled) {{
+                    var ok = document.execCommand("insertText", false, ch);
+                    if (!ok && nativeSetter) {{
+                        nativeSetter.call(el, (el.value || "") + ch);
+                        el.dispatchEvent(new Event("input", {{bubbles: true}}));
+                    }}
+                }}
+                el.dispatchEvent(new KeyboardEvent("keyup", keyOpts));
+            }}
+            // Final change event so blur-style validators fire
+            el.dispatchEvent(new Event("change", {{bubbles: true}}));
+            return "ok";
+        }})()'''
+        self._page._do_js(js)
+
+    def _type_keystroke(self, text):
+        escaped = _js_escape(text)
+        _jxa(f'''
+        var safari = Application("Safari");
+        safari.activate();
+        Application("System Events").keystroke({escaped});
+        "ok";
+        ''')
+
+    def press(self, key):
+        if self._use_keystroke():
+            self._press_keystroke(key)
+            return
+        # JS path: dispatch synthetic KeyboardEvent + handle special keys
+        # (Enter→form submit, Tab→focus next, Backspace/Delete→execCommand).
+        js = f'''(function(){{
+            var key = {_js_escape(key)};
+            var el = document.activeElement || document.body;
+            var keyMap = {{
+                Enter: {{key: "Enter", code: "Enter", keyCode: 13}},
+                Tab: {{key: "Tab", code: "Tab", keyCode: 9}},
+                Escape: {{key: "Escape", code: "Escape", keyCode: 27}},
+                Backspace: {{key: "Backspace", code: "Backspace", keyCode: 8}},
+                Delete: {{key: "Delete", code: "Delete", keyCode: 46}},
+                ArrowUp: {{key: "ArrowUp", code: "ArrowUp", keyCode: 38}},
+                ArrowDown: {{key: "ArrowDown", code: "ArrowDown", keyCode: 40}},
+                ArrowLeft: {{key: "ArrowLeft", code: "ArrowLeft", keyCode: 37}},
+                ArrowRight: {{key: "ArrowRight", code: "ArrowRight", keyCode: 39}},
+                Space: {{key: " ", code: "Space", keyCode: 32}},
+                Home: {{key: "Home", code: "Home", keyCode: 36}},
+                End: {{key: "End", code: "End", keyCode: 35}},
+                PageUp: {{key: "PageUp", code: "PageUp", keyCode: 33}},
+                PageDown: {{key: "PageDown", code: "PageDown", keyCode: 34}}
+            }};
+            var info = keyMap[key] || {{key: key, code: key, keyCode: 0}};
+            ["keydown", "keypress", "keyup"].forEach(function(type) {{
+                if (type === "keypress" && key.length > 1 && key !== "Enter" && key !== "Space") return;
+                try {{
+                    var ev = new KeyboardEvent(type, {{
+                        key: info.key, code: info.code, keyCode: info.keyCode,
+                        which: info.keyCode, bubbles: true, cancelable: true
+                    }});
+                    el.dispatchEvent(ev);
+                }} catch (e) {{}}
+            }});
+            if (key === "Enter") {{
+                // Synthetic Enter doesn't reliably submit forms in modern
+                // frameworks, so call requestSubmit / submit directly.
+                if (el.form) {{
+                    if (typeof el.form.requestSubmit === "function") {{
+                        try {{ el.form.requestSubmit(); }} catch(e) {{ el.form.submit(); }}
+                    }} else {{
+                        el.form.submit();
+                    }}
+                }}
+            }} else if (key === "Tab") {{
+                var focusables = Array.prototype.slice.call(document.querySelectorAll(
+                    'input, button, select, textarea, a[href], [tabindex]:not([tabindex="-1"])'
+                )).filter(function(e) {{ return !e.disabled && e.offsetParent !== null; }});
+                var idx = focusables.indexOf(el);
+                if (idx >= 0 && idx < focusables.length - 1) {{
+                    focusables[idx + 1].focus();
+                }} else if (focusables.length > 0) {{
+                    focusables[0].focus();
+                }}
+            }} else if (key === "Backspace") {{
+                if (el.isContentEditable || el.tagName === "INPUT" || el.tagName === "TEXTAREA") {{
+                    document.execCommand("delete", false);
+                }}
+            }} else if (key === "Delete") {{
+                if (el.isContentEditable || el.tagName === "INPUT" || el.tagName === "TEXTAREA") {{
+                    document.execCommand("forwardDelete", false);
+                }}
+            }}
+            return "ok";
+        }})()'''
+        self._page._do_js(js)
+
+    def _press_keystroke(self, key):
+        if key in MAC_KEY_CODES:
+            _jxa(f'''
+            var safari = Application("Safari");
+            safari.activate();
+            Application("System Events").keyCode({MAC_KEY_CODES[key]});
+            "ok";
+            ''')
+        else:
+            _jxa(f'''
+            var safari = Application("Safari");
+            safari.activate();
+            Application("System Events").keystroke({_js_escape(key)});
+            "ok";
+            ''')
+
+
+class _SafariTabProxy:
+    """Represents a Safari tab."""
+
+    def __init__(self, idx, tab_title, tab_url, window_idx=0):
+        self._idx = idx
+        self._title = tab_title
+        self._url = tab_url
+        self._win = window_idx
+
+    def title(self):
+        return self._title
+
+    @property
+    def url(self):
+        return self._url
+
+    def bring_to_front(self):
+        _jxa(f'''
+        var safari = Application("Safari");
+        safari.windows[{self._win}].currentTab = safari.windows[{self._win}].tabs[{self._idx}];
+        "ok";
+        ''')
+
+
+class _SafariCtx:
+    """Safari browser context — fetches tabs lazily via .pages."""
+
+    def __init__(self, window_idx=0):
+        self._win = window_idx
+
+    @property
+    def pages(self):
+        raw = _jxa(f'''
+        var safari = Application("Safari");
+        var win = safari.windows[{self._win}];
+        var tabs = [];
+        for (var i = 0; i < win.tabs.length; i++) {{
+            tabs.push({{title: win.tabs[i].name(), url: win.tabs[i].url()}});
+        }}
+        JSON.stringify(tabs);
+        ''')
+        tab_data = json.loads(raw) if raw else []
+        return [_SafariTabProxy(i, t["title"], t["url"], window_idx=self._win) for i, t in enumerate(tab_data)]
+
+
+class SafariPage:
+    """Safari page interface via JXA/osascript."""
+
+    def __init__(self, tab_idx=0, session_id=None, window_idx=0):
+        self._tab = tab_idx
+        self._win = window_idx
+        self.keyboard = _SafariKeyboard(page=self)
+        self._last_nav = {}  # cached title/url from goto()
+        self._session_id = session_id or _new_session_id()
+
+    def _find_tab_jxa(self):
+        """Return JXA code that finds this session's tab by marker.
+
+        Sets __pw_win (window ref) and __pw_tab (tab ref).
+        Assumes `var safari = Application("Safari");` is already declared.
+        """
+        return _build_tab_finder_jxa(self._session_id, self._win, self._tab)
+
+    def _do_js(self, js, timeout=30):
+        """Execute JS in the current Safari tab via doJavaScript.
+
+        Wraps the JS in a try/catch to detect errors that Safari's
+        doJavaScript would otherwise silently swallow.
+        """
+        # Wrap JS to catch errors and return them as a detectable signal
+        wrapped = f'''(function(){{
+            try {{ return {js}; }}
+            catch(e) {{ return "__PW_ERROR__:" + e.message; }}
+        }})()'''
+        escaped = json.dumps(wrapped)
+        script = f'''
+        var safari = Application("Safari");
+        {self._find_tab_jxa()}
+        safari.doJavaScript({escaped}, {{in: __pw_tab}});
+        '''
+        result = _jxa(script, timeout=timeout)
+        if result and result.startswith("__PW_ERROR__:"):
+            raise PwError(result[len("__PW_ERROR__:"):])
+        return result
+
+    def goto(self, url, wait_until=None, timeout=30000):
+        escaped_url = _js_escape(url)
+        timeout_s = max(timeout // 1000, 5)
+        script = f'''
+        var safari = Application("Safari");
+        {self._find_tab_jxa()}
+        var tab = __pw_tab;
+        var oldUrl = tab.url();
+        tab.url = {escaped_url};
+        var deadline = Date.now() + {timeout};
+        var sameUrlNav = (oldUrl === {escaped_url} || oldUrl === {escaped_url} + "/" ||
+                          oldUrl + "/" === {escaped_url});
+
+        if (sameUrlNav) {{
+            // Same-URL reload: just wait for readyState after a brief pause
+            delay(0.3);
+            while (Date.now() < deadline) {{
+                try {{
+                    var rs = safari.doJavaScript("document.readyState", {{in: tab}});
+                    if (rs === "complete") break;
+                }} catch(e) {{}}
+                delay(0.1);
+            }}
+        }} else {{
+            // Cross-URL nav: wait for JS context URL to change, then readyState
+            while (Date.now() < deadline) {{
+                try {{
+                    var jsUrl = safari.doJavaScript("location.href", {{in: tab}});
+                    if (jsUrl && jsUrl !== oldUrl) {{
+                        var rs = safari.doJavaScript("document.readyState", {{in: tab}});
+                        if (rs === "complete" || rs === "interactive") break;
+                    }}
+                }} catch(e) {{
+                    // doJavaScript may throw during page transitions — that's fine
+                }}
+                delay(0.1);
+            }}
+        }}
+
+        // Get title from JS context (tab.name() can be stale during navigation)
+        var finalTitle = "";
+        try {{ finalTitle = safari.doJavaScript("document.title", {{in: tab}}); }} catch(e) {{}}
+        if (!finalTitle) finalTitle = tab.name();
+        JSON.stringify({{title: finalTitle, url: tab.url()}});
+        '''
+        raw = _jxa(script, timeout=timeout_s + 5)
+        # Cache result to avoid extra osascript calls
+        try:
+            self._last_nav = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, TypeError):
+            self._last_nav = {}
+        # Inject session marker and managed flag for tab tracking
+        try:
+            self._do_js(f'window.__pw_session_id = {_js_escape(self._session_id)}; window.__pw_managed = true;')
+        except PwError:
+            pass
+        # Persist tab state
+        _write_tab_state({
+            "session_id": self._session_id,
+            "url": self._last_nav.get("url", ""),
+            "tab_index": self._tab,
+            "window_index": self._win,
+        })
+
+    def title(self):
+        if self._last_nav:
+            return self._last_nav.get("title", "")
+        finder = self._find_tab_jxa()
+        return _jxa(f'var safari = Application("Safari"); {finder} __pw_tab.name();') or ""
+
+    @property
+    def url(self):
+        if self._last_nav:
+            return self._last_nav.get("url", "")
+        finder = self._find_tab_jxa()
+        return _jxa(f'var safari = Application("Safari"); {finder} __pw_tab.url();') or ""
+
+
+    def _auto_wait(self, sel_js, timeout=5000):
+        """Poll for element existence up to timeout. Returns True if found.
+
+        Polls at 1s intervals (not faster) to avoid overwhelming Safari's
+        Apple Events handler, which can cause macOS to kill Safari for
+        excessive CPU usage.
+        """
+        check_js = json.dumps(f'({sel_js}) !== null ? "found" : "nope"')
+        finder = self._find_tab_jxa()
+        # First check immediately
+        try:
+            result = _jxa(f'''
+            var safari = Application("Safari");
+            {finder}
+            safari.doJavaScript({check_js}, {{in: __pw_tab}});
+            ''', timeout=5)
+            if result == "found":
+                return True
+        except PwError:
+            pass
+        # Then poll at 1s intervals — gentle on Safari's event handler
+        deadline = time.time() + timeout / 1000
+        while time.time() < deadline:
+            time.sleep(1.0)
+            try:
+                result = _jxa(f'''
+                var safari = Application("Safari");
+                {finder}
+                safari.doJavaScript({check_js}, {{in: __pw_tab}});
+                ''', timeout=5)
+                if result == "found":
+                    return True
+            except PwError:
+                pass
+        return False
+
+    def _click_js(self, sel_js, selector):
+        """Generate JS that clicks with React fiber support.
+
+        Strategy (all background-safe via doJavaScript):
+          A: el.click() -- native DOM method, works for many components.
+          B: React 18 internal dispatch -- find the click listener registered on
+             the React root container and invoke it via __dispatchEvent or by
+             walking the fiber tree to find the actual app-level handler.
+          C: React fiber onClick/onMouseDown prop invocation.
+          D: Full synthetic pointer/mouse event sequence as last resort.
+        """
+        return (
+            "(function(){"
+            + REACT_FIBER_JS +
+
+            # Utility: find app-level onClick by walking up past MUI wrapper components
+            "function __pw_findAppHandler(fiber) {"
+            "  var current = fiber;"
+            "  var handlers = [];"
+            "  while (current) {"
+            "    if (current.memoizedProps && current.memoizedProps.onClick) {"
+            "      handlers.push({handler: current.memoizedProps.onClick, type: current.type,"
+            "        name: typeof current.type === 'function' ? current.type.name || current.type.displayName : String(current.type)});"
+            "    }"
+            "    current = current.return;"
+            "  }"
+            # Return the highest-level handler (closest to app root, furthest from DOM)
+            # Skip the first one if it's on 'button' (MUI ButtonBase ripple handler)
+            "  if (handlers.length > 1 && handlers[0].name === 'button') return handlers[handlers.length - 1];"
+            "  return handlers.length > 0 ? handlers[handlers.length - 1] : null;"
+            "}"
+
+            "var el = " + sel_js + ";"
+            "if (!el) throw new Error('Element not found: ' + " + _js_escape(selector) + ");"
+            "el.scrollIntoView({block: 'center'});"
+
+            # Strategy A: el.click()
+            "try { el.click(); } catch(e) {}"
+
+            # Strategy B: Find app-level handler via fiber tree (skip MUI wrappers)
+            "var fiber = __pw_getReactFiber(el);"
+            "if (fiber) {"
+            "  var appHandler = __pw_findAppHandler(fiber);"
+            "  if (appHandler && appHandler.handler) {"
+            "    try {"
+            "      appHandler.handler(__pw_makeSyntheticEvent(el, 'click'));"
+            "      return 'clicked (react app handler: ' + appHandler.name + ')';"
+            "    } catch(e) {}"
+            "  }"
+
+            # Strategy C: Direct fiber prop handlers (onMouseDown + onClick)
+            "  var onMD = __pw_findHandler(fiber, 'onMouseDown');"
+            "  if (onMD) { try { onMD(__pw_makeSyntheticEvent(el, 'mousedown')); } catch(e) {} }"
+            "  var onClick = __pw_findHandler(fiber, 'onClick');"
+            "  if (onClick) {"
+            "    try { onClick(__pw_makeSyntheticEvent(el, 'click')); } catch(e) {}"
+            "    return 'clicked (react fiber onClick)';"
+            "  }"
+            "}"
+
+            # Strategy D: Synthetic event sequence
+            "var rect = el.getBoundingClientRect();"
+            "var x = rect.left + rect.width / 2;"
+            "var y = rect.top + rect.height / 2;"
+            "var opts = {bubbles: true, cancelable: true, view: window,"
+            "  clientX: x, clientY: y, screenX: x, screenY: y,"
+            "  button: 0, buttons: 1};"
+            "el.dispatchEvent(new PointerEvent('pointerdown', opts));"
+            "el.dispatchEvent(new MouseEvent('mousedown', opts));"
+            "el.dispatchEvent(new PointerEvent('pointerup', opts));"
+            "el.dispatchEvent(new MouseEvent('mouseup', opts));"
+            "el.dispatchEvent(new MouseEvent('click', opts));"
+            "return 'clicked (el.click + synthetic events)';"
+            "})()"
+        )
+
+
+    def click(self, selector, timeout=5000):
+        sel_js = _translate_selector(selector)
+        # Auto-wait for element to appear
+        if not self._auto_wait(sel_js, timeout):
+            raise PwError(f"Element not found (timeout {timeout}ms): {selector}")
+        # Batch: click + wait for potential navigation + title/url in one JXA call
+        js_code = json.dumps(self._click_js(sel_js, selector))
+        script = f'''
+        var safari = Application("Safari");
+        {self._find_tab_jxa()}
+        var tab = __pw_tab;
+        var urlBefore = tab.url();
+        safari.doJavaScript({js_code}, {{in: tab}});
+        // Wait for potential navigation (URL change or page load)
+        var deadline = Date.now() + {timeout};
+        delay(0.05);
+        while (Date.now() < deadline) {{
+            try {{
+                var u = tab.url();
+                if (u !== urlBefore) {{
+                    // URL changed — wait for title to settle
+                    delay(0.2);
+                    try {{ safari.doJavaScript("document.readyState", {{in: tab}}); }} catch(e2) {{}}
+                    break;
+                }}
+                // URL same — page didn't navigate, we're done
+                break;
+            }} catch(e) {{
+                delay(0.2);
+            }}
+        }}
+        JSON.stringify({{title: tab.name(), url: tab.url()}});
+        '''
+        self._last_nav = {}
+        try:
+            raw = _jxa(script, timeout=timeout // 1000 + 5)
+            self._last_nav = json.loads(raw) if raw else {}
+        except PwError as e:
+            err = str(e)
+            if "Element not found" in err:
+                raise
+            # JXA timeout after click is non-fatal (click succeeded, page may be loading)
+            if "timed out" in err.lower():
+                self._last_nav = {}
+            else:
+                raise
+
+    def _react_click_js(self, sel_js, selector):
+        """JS that clicks exclusively via React fiber handlers."""
+        return (
+            "(function(){"
+            + REACT_FIBER_JS +
+            "var el = " + sel_js + ";"
+            "if (!el) throw new Error('Element not found: ' + " + _js_escape(selector) + ");"
+            "el.scrollIntoView({block: 'center'});"
+            "var fiber = __pw_getReactFiber(el);"
+            "if (!fiber) { el.click(); return 'clicked (no fiber, used el.click)'; }"
+            "var onMD = __pw_findHandler(fiber, 'onMouseDown');"
+            "if (onMD) { try { onMD(__pw_makeSyntheticEvent(el, 'mousedown')); } catch(e) {} }"
+            "var onClick = __pw_findHandler(fiber, 'onClick');"
+            "if (onClick) { onClick(__pw_makeSyntheticEvent(el, 'click')); return 'clicked (react fiber onClick)'; }"
+            "var onPress = __pw_findHandler(fiber, 'onPress');"
+            "if (onPress) { onPress(__pw_makeSyntheticEvent(el, 'click')); return 'clicked (react fiber onPress)'; }"
+            "el.click();"
+            "return 'clicked (fiber found, no handler, used el.click)';"
+            "})()"
+        )
+
+    def _react_set_js(self, sel_js, selector, prop, value):
+        """JS that sets a React component prop by invoking its handler."""
+        escaped_prop = _js_escape(prop)
+        escaped_value = _js_escape(value)
+        return (
+            "(function(){"
+            + REACT_FIBER_JS +
+            "var el = " + sel_js + ";"
+            "if (!el) throw new Error('Element not found: ' + " + _js_escape(selector) + ");"
+            "var fiber = __pw_getReactFiber(el);"
+            "if (!fiber) throw new Error('No React fiber on: ' + " + _js_escape(selector) + ");"
+            "var propName = " + escaped_prop + ";"
+            "var handler = __pw_findHandler(fiber, propName);"
+            "if (!handler) throw new Error('No ' + propName + ' handler in fiber tree for: ' + " + _js_escape(selector) + ");"
+            "var rawValue = " + escaped_value + ";"
+            "var parsedValue; try { parsedValue = JSON.parse(rawValue); } catch(e) { parsedValue = rawValue; }"
+            "if (propName === 'onChange') {"
+            "  handler({target: {value: parsedValue}, currentTarget: {value: parsedValue},"
+            "    preventDefault: function(){}, stopPropagation: function(){}});"
+            "} else { handler(parsedValue); }"
+            "return 'set ' + propName + ' via React fiber';"
+            "})()"
+        )
+
+    def react_click(self, selector, timeout=5000):
+        """Click via React fiber handlers (background-safe)."""
+        sel_js = _translate_selector(selector)
+        # Auto-wait for element
+        if not self._auto_wait(sel_js, timeout):
+            raise PwError(f"Element not found (timeout {timeout}ms): {selector}")
+        js_code = json.dumps(self._react_click_js(sel_js, selector))
+        script = f"""
+        var safari = Application("Safari");
+        {self._find_tab_jxa()}
+        var tab = __pw_tab;
+        var urlBefore = tab.url();
+        var result = safari.doJavaScript({js_code}, {{in: tab}});
+        var deadline = Date.now() + {timeout};
+        delay(0.05);
+        while (Date.now() < deadline) {{
+            try {{
+                var u = tab.url();
+                if (u !== urlBefore) {{
+                    delay(0.2);
+                    try {{ safari.doJavaScript("document.readyState", {{in: tab}}); }} catch(e2) {{}}
+                    break;
+                }}
+                break;
+            }} catch(e) {{ delay(0.2); }}
+        }}
+        JSON.stringify({{title: tab.name(), url: tab.url(), method: result}});
+        """
+        self._last_nav = {}
+        try:
+            raw = _jxa(script, timeout=timeout // 1000 + 5)
+            info = json.loads(raw) if raw else {}
+            self._last_nav = info
+            return info.get("method", "clicked")
+        except PwError as e:
+            if "Element not found" in str(e) or "No React fiber" in str(e):
+                raise
+            if "timed out" in str(e).lower():
+                self._last_nav = {}
+                return "clicked (timed out waiting for nav)"
+            raise
+
+    def react_set(self, selector, prop, value, timeout=5000):
+        """Set a React component prop via its handler (background-safe)."""
+        sel_js = _translate_selector(selector)
+        # Auto-wait for element
+        if not self._auto_wait(sel_js, timeout):
+            raise PwError(f"Element not found (timeout {timeout}ms): {selector}")
+        js = self._react_set_js(sel_js, selector, prop, value)
+        return self._do_js(js, timeout=timeout // 1000 + 5)
+
+    def wait_for_load_state(self, state=None, timeout=5000):
+        # click() already waits for navigation and caches title/url.
+        # This is a no-op for Safari.
+        pass
+
+    def fill_search(self, selector, text, timeout=8000):
+        """Fill a search input in a React SPA (e.g., Instacart).
+
+        Handles the two-phase pattern common in modern SPAs:
+        1. Click the visible search trigger to open the search modal/overlay
+        2. Find the actual input that receives keyboard focus
+        3. Fill it using native setter + React fiber onChange
+        4. Submit by dispatching Enter keydown event
+
+        Returns the page text after submission for result scanning.
+        """
+        self._last_nav = {}
+        sel_js = _translate_selector(selector)
+        escaped_text = _js_escape(text)
+
+        # Phase 1: Click the trigger element and wait for the real input
+        # Phase 2: Find the focused/modal input, fill it, and press Enter
+        js = (
+            "(function(){"
+            + REACT_FIBER_JS +
+            # Click the visible trigger element
+            "var trigger = " + sel_js + ";"
+            "if (!trigger) throw new Error('Trigger not found: ' + " + _js_escape(selector) + ");"
+            "trigger.click(); trigger.focus();"
+
+            # Wait briefly for modal/overlay to open
+            "return new Promise(function(resolve) {"
+            "  setTimeout(function() {"
+
+            # Find the actual input: prefer the focused element if it's an input,
+            # otherwise find any visible text input that appeared
+            "    var target = document.activeElement;"
+            "    if (!target || target === document.body || target.tagName !== 'INPUT') {"
+            "      var inputs = document.querySelectorAll('input[type=text], input[type=search], input:not([type])');"
+            "      var best = null;"
+            "      for (var i = 0; i < inputs.length; i++) {"
+            "        var r = inputs[i].getBoundingClientRect();"
+            "        if (r.width > 0 && r.height > 0 && r.y > -1000) {"
+            # Prefer inputs that aren't the trigger
+            "          if (inputs[i] !== trigger) { best = inputs[i]; break; }"
+            "        }"
+            "      }"
+            "      if (best) { target = best; target.focus(); }"
+            "    }"
+            "    if (!target || target === document.body) {"
+            "      resolve('error: no input found after click');"
+            "      return;"
+            "    }"
+
+            # Fill using native setter + React compat
+            "    var proto = (target.tagName === 'TEXTAREA') ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
+            "    var setter = Object.getOwnPropertyDescriptor(proto, 'value');"
+            "    if (setter && setter.set) setter.set.call(target, " + escaped_text + ");"
+            "    else target.value = " + escaped_text + ";"
+            "    var tracker = target._valueTracker; if (tracker) tracker.setValue('');"
+            "    target.dispatchEvent(new Event('input', {bubbles: true}));"
+            "    target.dispatchEvent(new Event('change', {bubbles: true}));"
+
+            # Invoke React fiber onChange if available
+            "    var fiber = __pw_getReactFiber(target);"
+            "    if (fiber) {"
+            "      var onChange = __pw_findHandler(fiber, 'onChange');"
+            "      if (onChange) {"
+            "        try { onChange({target: {value: " + escaped_text + "}, currentTarget: {value: " + escaped_text + "},"
+            "          preventDefault: function(){}, stopPropagation: function(){}}); } catch(e) {}"
+            "      }"
+            "    }"
+
+            # Wait for suggestions to render, then submit with Enter
+            "    setTimeout(function() {"
+            "      target.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true}));"
+            "      target.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true}));"
+            "      target.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true}));"
+
+            # Also try form submit as fallback
+            "      var form = target.closest('form');"
+            "      if (form) { try { form.requestSubmit(); } catch(e) {} }"
+
+            "      setTimeout(function() {"
+            "        resolve('searched: ' + target.className.substring(0, 30));"
+            "      }, 2000);"
+            "    }, 500);"
+
+            "  }, 500);"
+            "});"
+            "})()"
+        )
+        result = self._do_js(js, timeout=timeout // 1000 + 10)
+        return result
+
+    def fill(self, selector, text, timeout=5000):
+        self._last_nav = {}  # mutation — invalidate cache
+        sel_js = _translate_selector(selector)
+        # Auto-wait for element
+        if not self._auto_wait(sel_js, timeout):
+            raise PwError(f"Element not found (timeout {timeout}ms): {selector}")
+        escaped_text = _js_escape(text)
+        # Enhanced React-compatible fill with MUI date input support.
+        # 1. Native setter + valueTracker reset (standard React)
+        # 2. Detect MUI date fields and invoke onChange/onAccept via React fiber
+        # 3. Dispatch input/change/blur events for validation
+        js = (
+            "(function(){"
+            + REACT_FIBER_JS +
+            "var el = " + sel_js + ";"
+            "if (!el) throw new Error('Element not found: ' + " + _js_escape(selector) + ");"
+            "el.focus();"
+            "var isMuiDate = false;"
+            "if (el.type === 'tel' || el.getAttribute('role') === 'textbox') {"
+            "  var p = el.closest('.MuiDatePicker-root, .MuiTextField-root, .MuiInputBase-root, [class*=MuiDateField], [class*=MuiDatePicker]');"
+            "  if (p) isMuiDate = true;"
+            "}"
+            "var ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();"
+            "if (ariaLabel.match(/date|month|year|day/)) isMuiDate = true;"
+            "var proto = (el.tagName === 'TEXTAREA') ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
+            "var nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value');"
+            "if (nativeSetter && nativeSetter.set) { nativeSetter.set.call(el, " + escaped_text + "); }"
+            "else { el.value = " + escaped_text + "; }"
+            "var tracker = el._valueTracker; if (tracker) tracker.setValue('');"
+            "el.dispatchEvent(new Event('input', {bubbles: true}));"
+            "el.dispatchEvent(new Event('change', {bubbles: true}));"
+            "var fiber = __pw_getReactFiber(el);"
+            "if (fiber) {"
+            "  var onChange = __pw_findHandler(fiber, 'onChange');"
+            "  if (onChange) {"
+            "    try { onChange({target: {value: " + escaped_text + "}, currentTarget: {value: " + escaped_text + "},"
+            "      preventDefault: function(){}, stopPropagation: function(){}}); } catch(e) {}"
+            "  }"
+            "  if (isMuiDate) {"
+            "    var onAccept = __pw_findHandler(fiber, 'onAccept');"
+            "    if (onAccept) { try { onAccept(" + escaped_text + "); } catch(e) {} }"
+            "  }"
+            "}"
+            "el.dispatchEvent(new Event('blur', {bubbles: true}));"
+            "return isMuiDate ? 'filled (MUI date)' : 'filled';"
+            "})()"
+        )
+        self._do_js(js, timeout=timeout // 1000 + 5)
+
+    def select_option(self, selector, value, timeout=5000):
+        self._last_nav = {}  # mutation — invalidate cache
+        sel_js = _translate_selector(selector)
+        escaped_val = _js_escape(value)
+
+        # Step 1: Check if it's a native <select> element
+        tag_js = f'(function(){{ var el={sel_js}; return el ? el.tagName : null; }})()'
+        tag = self._do_js(tag_js)
+
+        if tag == 'SELECT':
+            # Native <select> with React compatibility
+            js = f'''(function(){{
+                var el = {sel_js};
+                if (!el) throw new Error("Element not found: " + {_js_escape(selector)});
+                var setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+                if (setter && setter.set) setter.set.call(el, {escaped_val});
+                else el.value = {escaped_val};
+                var t = el._valueTracker; if (t) t.setValue("");
+                el.dispatchEvent(new Event("change", {{bubbles: true}}));
+                return "selected";
+            }})()'''
+            self._do_js(js, timeout=timeout // 1000 + 5)
+        else:
+            # Custom dropdown: click trigger to open, wait, find and click option
+            click_js = self._click_js(sel_js, selector)
+            self._do_js(click_js, timeout=timeout // 1000 + 5)
+            time.sleep(0.3)  # wait for dropdown to render
+            js = f'''(function(){{
+                var val = {escaped_val};
+                var selectors = [
+                    "[role='option']", "[role='listbox'] li",
+                    ".MuiMenuItem-root", ".a-dropdown-item a",
+                    "ul[role='listbox'] > li", ".dropdown-item", "li[data-value]"
+                ];
+                var options = document.querySelectorAll(selectors.join(", "));
+                for (var i = 0; i < options.length; i++) {{
+                    var opt = options[i];
+                    var text = opt.textContent.trim();
+                    var dataVal = opt.getAttribute("data-value") || "";
+                    if (text === val || dataVal === val) {{
+                        opt.scrollIntoView({{block: "center"}});
+                        opt.click();
+                        return "selected";
+                    }}
+                }}
+                throw new Error("Option not found: " + val);
+            }})()'''
+            self._do_js(js, timeout=timeout // 1000 + 5)
+
+    def screenshot(self, path=None, full_page=False):
+        path = path or SCREENSHOT_DEFAULT
+        # Normalize to an absolute path before passing to `screencapture`.
+        # `screencapture -x foo` would treat a `-`-prefixed filename like
+        # `-T10` as a flag, not a path; absolute paths begin with '/' and
+        # are unambiguous.
+        path = os.path.abspath(os.path.expanduser(path))
+        # screencapture -l<windowID> reads from the window-server backing
+        # store, so it works even when Safari is occluded or in the
+        # background. We switch the pw tab to be Safari's currentTab (so
+        # the right page is in the backing buffer), capture, then restore
+        # the user's original tab. No safari.activate() — fully backgrounded.
+        original_tab = 0
+        try:
+            info_raw = _jxa(f'''
+            var safari = Application("Safari");
+            {self._find_tab_jxa()}
+            var win = __pw_win;
+            var cur = win.currentTab();
+            var origIdx = 0;
+            for (var i = 0; i < win.tabs.length; i++) {{
+                if (win.tabs[i].id() === cur.id()) {{ origIdx = i; break; }}
+            }}
+            win.currentTab = __pw_tab;
+            JSON.stringify({{windowId: win.id(), originalTab: origIdx}});
+            ''')
+            info = json.loads(info_raw) if info_raw else {}
+            win_id = str(info.get("windowId", ""))
+            original_tab = _coerce_index(info.get("originalTab", 0))
+            if win_id and win_id.isdigit():
+                subprocess.run(
+                    ["screencapture", f"-l{win_id}", "-x", path],
+                    capture_output=True, timeout=10,
+                )
+                # Note: window-server capture works in the background even when
+                # Safari is occluded or minimized. We deliberately do NOT fall
+                # back to safari.activate() if the file looks small — sparse
+                # pages legitimately compress below any size threshold, and
+                # foregrounding Safari while the user is in another app is
+                # disruptive. If the capture genuinely failed, the file will
+                # be missing, not just small; surface that to the caller.
+                if not os.path.exists(path):
+                    print(
+                        f"pw: screenshot capture failed for window {win_id}",
+                        file=sys.stderr,
+                    )
+            else:
+                subprocess.run(["screencapture", "-x", path], capture_output=True, timeout=10)
+        except (PwError, json.JSONDecodeError):
+            # Fallback: full-screen capture
+            subprocess.run(["screencapture", "-x", path], capture_output=True, timeout=10)
+        # Restore user's original tab (use finder to get the right window).
+        # If this fails we tell the user — silent failure here would leave
+        # them looking at the pw tab without explanation.
+        try:
+            finder = self._find_tab_jxa()
+            _jxa(f'var safari = Application("Safari"); {finder} __pw_win.currentTab = __pw_win.tabs[{original_tab}];')
+        except PwError as e:
+            print(f"pw: warning — could not restore your Safari tab: {e}", file=sys.stderr)
+
+    def dismiss_popups(self):
+        """Dismiss common popups, cookie banners, and marketing modals."""
+        js = '''(function(){
+            var dismissed = [];
+            // Try common close button selectors
+            var closeSelectors = [
+                '[aria-label="Close"]', '[aria-label="close"]', '[aria-label="Dismiss"]',
+                '[aria-label*="close" i]', '[aria-label*="dismiss" i]',
+                'button[class*="close"]', '[data-testid="close"]', '[data-dismiss]',
+                '.modal-close', '.popup-close', '.close-btn',
+                '[class*="cookie"] button', '[id*="cookie"] button',
+                '[class*="consent"] button', '[id*="consent"] button'
+            ];
+            for (var i = 0; i < closeSelectors.length; i++) {
+                var els = document.querySelectorAll(closeSelectors[i]);
+                for (var j = 0; j < els.length; j++) {
+                    try { els[j].click(); dismissed.push(closeSelectors[i]); } catch(e) {}
+                }
+            }
+            // Try buttons with common accept/close text
+            var btns = document.querySelectorAll('button');
+            for (var k = 0; k < btns.length; k++) {
+                var txt = btns[k].textContent.trim().toLowerCase();
+                if (txt === 'accept' || txt === 'close' || txt === 'got it' ||
+                    txt === 'accept all' || txt === 'ok' || txt === 'i agree' ||
+                    txt === 'dismiss' || txt === 'no thanks') {
+                    try { btns[k].click(); dismissed.push('button:' + txt); } catch(e) {}
+                }
+            }
+            // Remove high z-index overlays
+            var all = document.querySelectorAll('div');
+            for (var m = 0; m < all.length; m++) {
+                var style = window.getComputedStyle(all[m]);
+                if (parseInt(style.zIndex) > 9000 && style.position === 'fixed' &&
+                    parseFloat(style.opacity) < 1) {
+                    all[m].remove(); dismissed.push('overlay');
+                }
+            }
+            // Unlock body scroll
+            document.body.style.overflow = '';
+            document.documentElement.style.overflow = '';
+            return dismissed.length > 0 ? 'dismissed: ' + dismissed.join(', ') : 'nothing to dismiss';
+        })()'''
+        return self._do_js(js) or "nothing to dismiss"
+
+    def query_selector(self, selector):
+        sel_js = _translate_selector(selector)
+        js = f'({sel_js}) ? "found" : null'
+        result = self._do_js(js)
+        if not result or result == "null":
+            return None
+        return _SafariElement(sel_js, self._tab, self._win, session_id=self._session_id)
+
+    def inner_text(self, selector):
+        sel_js = _translate_selector(selector)
+        js = f'(function(){{ var el={sel_js}; return el ? el.innerText : ""; }})()'
+        return self._do_js(js) or ""
+
+    def content(self):
+        js = 'document.documentElement.outerHTML.substring(0, 100000)'
+        return self._do_js(js) or ""
+
+    def evaluate(self, js):
+        # Auto-wrap multi-statement JS in IIFE so Safari returns the last value
+        js = _wrap_multi_statement_js(js)
+        # Wrap user JS to serialize the result for transport through JXA.
+        # Use a function body with direct code insertion (not eval()) to avoid
+        # double-escaping issues with complex JS expressions.
+        wrapper = f'''(function(){{
+            try {{
+                var __r = {js};
+                if (__r === undefined || __r === null) return "null";
+                if (typeof __r === "object") return JSON.stringify(__r);
+                return String(__r);
+            }} catch(e) {{
+                return JSON.stringify({{"__error": e.message}});
+            }}
+        }})()'''
+        raw = self._do_js(wrapper)
+        if raw is None or raw == "null":
+            return None
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and "__error" in parsed:
+                raise PwError(f"JS error: {parsed['__error']}")
+            return parsed
+        except json.JSONDecodeError:
+            return raw
+
+    def wait_for_selector(self, selector, timeout=10000):
+        sel_js = _translate_selector(selector)
+        check_js = json.dumps(f'({sel_js}) ? "found" : "nope"')
+        timeout_s = max(timeout // 1000, 1)
+        script = f'''
+        var safari = Application("Safari");
+        {self._find_tab_jxa()}
+        var tab = __pw_tab;
+        var deadline = Date.now() + {timeout};
+        while (Date.now() < deadline) {{
+            try {{
+                var r = safari.doJavaScript({check_js}, {{in: tab}});
+                if (r === "found") {{ "found"; break; }}
+            }} catch(e) {{}}
+            delay(0.1);
+        }}
+        '''
+        result = _jxa(script, timeout=timeout_s + 5)
+        if result != "found":
+            raise PwError(f"Timeout waiting for: {selector}")
+
+    def go_back(self, wait_until=None, timeout=5000):
+        # Batch: trigger back, wait for load, return title+url
+        script = f'''
+        var safari = Application("Safari");
+        {self._find_tab_jxa()}
+        var tab = __pw_tab;
+        var oldUrl = tab.url();
+        safari.doJavaScript("history.back()", {{in: tab}});
+        delay(0.1);
+        var deadline = Date.now() + {timeout};
+        while (Date.now() < deadline) {{
+            try {{
+                var u = tab.url();
+                if (u !== oldUrl) break;
+            }} catch(e) {{}}
+            delay(0.2);
+        }}
+        JSON.stringify({{title: tab.name(), url: tab.url()}});
+        '''
+        try:
+            raw = _jxa(script, timeout=timeout // 1000 + 5)
+            self._last_nav = json.loads(raw) if raw else {}
+        except (PwError, json.JSONDecodeError):
+            self._last_nav = {}
+
+
+def _safari_session_file():
+    """Return the state file path for the current session."""
+    name = _session_name
+    if name:
+        # _session_name is validated by _safe_session_name() at parse time,
+        # but re-validate defensively in case it's set programmatically.
+        safe = _safe_session_name(name)
+        return os.path.join(STATE_DIR, f"session-{safe}.json")
+    return SAFARI_TAB_FILE
+
+
+def _coerce_index(value, default=0):
+    """Coerce a persisted index to a non-negative int. Indices flow into JXA
+    via f-strings (safari.windows[N].tabs[N]); a tampered state file with a
+    string value would otherwise inject arbitrary JXA. Reject anything that
+    isn't a plain non-negative integer."""
+    if isinstance(value, bool):
+        return default  # bool is a subclass of int but not what we want
+    if isinstance(value, int) and value >= 0:
+        return value
+    return default
+
+
+def _sanitize_state(state):
+    """Re-coerce index fields read from disk before they cross into JXA."""
+    if not isinstance(state, dict):
+        return None
+    state["tab_index"] = _coerce_index(state.get("tab_index", 0))
+    state["window_index"] = _coerce_index(state.get("window_index", 0))
+    sid = state.get("session_id", "")
+    if not isinstance(sid, str):
+        sid = ""
+    state["session_id"] = sid
+    url = state.get("url", "")
+    if not isinstance(url, str):
+        url = ""
+    state["url"] = url
+    return state
+
+
+def _read_tab_state():
+    """Read the persisted Safari tab state. Returns dict or None."""
+    path = _safari_session_file()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            raw = f.read().strip()
+        # Handle legacy integer format
+        try:
+            idx = int(raw)
+            return {"tab_index": idx}
+        except ValueError:
+            pass
+        return _sanitize_state(json.loads(raw))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_tab_state(state):
+    """Write tab state to the session file with mode 0600 in the per-user
+    state dir. Open with O_NOFOLLOW so a pre-created symlink at the path
+    can't redirect the write to another file."""
+    _ensure_state_dir()
+    path = _safari_session_file()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        # If something already exists at the path that we can't open safely
+        # (e.g. a symlink), refuse rather than follow it.
+        return
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f)
+
+
+def _safari_tab_index():
+    """Read the persisted Safari tab index."""
+    state = _read_tab_state()
+    if not state:
+        return 0
+    return state.get("tab_index", 0)
+
+
+def _new_session_id():
+    """Mint a unique pw session id."""
+    global _session_counter
+    _session_counter += 1
+    return f"pw_{os.getpid()}_{int(time.time() * 1000) % 1000000}_{_session_counter}"
+
+
+def _safari_create_new_tab(session_id=None):
+    """Create a new tab in the frontmost Safari window.
+
+    Never creates new windows — only adds a tab to an existing window.
+    Only creates a window if Safari has zero windows open.
+    Returns (window_index, tab_index, session_id).
+
+    Navigates the new tab to about:blank so doJavaScript has a document
+    to run against (a freshly-pushed Safari Tab object has no document
+    and silently swallows JS), then injects window.__pw_session_id and
+    window.__pw_managed. The resolver can then find this tab on
+    subsequent commands without waiting for nav() to inject the marker.
+    If session_id is None, a fresh one is minted.
+    """
+    sid = session_id or _new_session_id()
+    # Bake the marker into the initial URL via a data: page. This survives
+    # the navigation race: setting url="about:blank" reports readyState
+    # "complete" instantly (from the prior empty doc), but about:blank
+    # then finishes loading and replaces the window object, wiping any
+    # marker we injected during that window. With a data: URL the marker
+    # is part of the rendered document itself, so it's there as soon as
+    # the page is loaded.
+    blank_html = (
+        f"<!doctype html><title>pw</title>"
+        f"<script>window.__pw_session_id={json.dumps(sid)};"
+        f"window.__pw_managed=true;</script>"
+    )
+    data_url = "data:text/html;charset=utf-8," + urllib.parse.quote(blank_html)
+    url_js = json.dumps(data_url)
+    script = f'''
+    var safari = Application("Safari");
+
+    // Only create a window if none exist
+    if (safari.windows.length === 0) {{
+        safari.Document().make();
+        delay(0.3);
+    }}
+
+    // Use frontmost window (windows[0] in z-order)
+    var win = safari.windows[0];
+
+    // Push tab, then assign URL. Safari's JXA Tab() constructor doesn't
+    // accept {{url: ...}}; the URL must be set after push.
+    var newTab = safari.Tab();
+    win.tabs.push(newTab);
+    var tabIdx = win.tabs.length - 1;
+    win.tabs[tabIdx].url = {url_js};
+
+    // Poll readyState so the tab is actually navigable when we return.
+    var deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {{
+        try {{
+            var rs = safari.doJavaScript("document.readyState", {{in: win.tabs[tabIdx]}});
+            if (rs === "complete") break;
+        }} catch(e) {{}}
+        delay(0.05);
+    }}
+
+    JSON.stringify({{window_index: 0, tab_index: tabIdx}});
+    '''
+    raw = _jxa(script)
+    result = json.loads(raw) if raw else {}
+    return (result.get("window_index", 0), result.get("tab_index", 0), sid)
+
+
+def _resolve_safari_tab(create_if_missing=False):
+    """Resolve the correct Safari (window_idx, tab_idx, session_id).
+
+    Uses session marker (window.__pw_session_id) first, then URL match,
+    then falls back to stored indices. Scans ALL windows, not just windows[0].
+
+    When create_if_missing=True and a named session's tab cannot be found,
+    creates a new tab instead of falling back to the user's current tab.
+    Any new tab is created with its session marker injected at creation
+    time, and state is updated to match.
+
+    Returns (window_idx, tab_idx, session_id).
+    """
+    state = _read_tab_state()
+    if not state:
+        if _session_name or create_if_missing:
+            # Named session with no state — ALWAYS create a new tab.
+            # Never fall back to tab 0 (user's tab).
+            win_idx, tab_idx, sid = _safari_create_new_tab()
+            _write_tab_state({
+                "session_id": sid,
+                "url": "",
+                "tab_index": tab_idx,
+                "window_index": win_idx,
+            })
+            return (win_idx, tab_idx, sid)
+        return (0, 0, "")
+
+    session_id = state.get("session_id", "")
+    stored_url = state.get("url", "")
+    stored_idx = state.get("tab_index", 0)
+    stored_win = state.get("window_index", 0)
+
+    if not session_id and not stored_url:
+        return (stored_win, stored_idx, session_id)
+
+    # Scan ALL windows and tabs for session marker, then URL
+    scan_js = f'''
+    var safari = Application("Safari");
+    var markerWin = -1, markerTab = -1;
+    var urlWin = -1, urlTab = -1;
+    var targetSid = {json.dumps(session_id)};
+    var targetUrl = {json.dumps(stored_url)};
+    var winCount = safari.windows.length;
+    for (var w = 0; w < winCount; w++) {{
+        var tabCount = safari.windows[w].tabs.length;
+        for (var t = 0; t < tabCount; t++) {{
+            try {{
+                if (targetSid && markerWin < 0) {{
+                    var sid = safari.doJavaScript("window.__pw_session_id || ''", {{in: safari.windows[w].tabs[t]}});
+                    if (sid === targetSid) {{ markerWin = w; markerTab = t; break; }}
+                }}
+            }} catch(e) {{}}
+            try {{
+                if (targetUrl && urlWin < 0) {{
+                    var u = safari.windows[w].tabs[t].url();
+                    if (u === targetUrl) {{ urlWin = w; urlTab = t; }}
+                }}
+            }} catch(e) {{}}
+        }}
+        if (markerWin >= 0) break;
+    }}
+    JSON.stringify({{markerWin: markerWin, markerTab: markerTab, urlWin: urlWin, urlTab: urlTab, winCount: winCount}});
+    '''
+    try:
+        raw = _jxa(scan_js, timeout=15)
+        result = json.loads(raw) if raw else {}
+        marker_win = result.get("markerWin", -1)
+        marker_tab = result.get("markerTab", -1)
+        url_win = result.get("urlWin", -1)
+        url_tab = result.get("urlTab", -1)
+        win_count = result.get("winCount", 0)
+
+        if marker_win >= 0 and marker_tab >= 0:
+            if marker_win != stored_win or marker_tab != stored_idx:
+                state["tab_index"] = marker_tab
+                state["window_index"] = marker_win
+                _write_tab_state(state)
+            return (marker_win, marker_tab, session_id)
+        if url_win >= 0 and url_tab >= 0:
+            if url_win != stored_win or url_tab != stored_idx:
+                state["tab_index"] = url_tab
+                state["window_index"] = url_win
+                _write_tab_state(state)
+            return (url_win, url_tab, session_id)
+
+        # Neither marker nor URL found — tab is gone or user navigated it away
+        if create_if_missing and _session_name:
+            win_idx, tab_idx, sid = _safari_create_new_tab()
+            state["tab_index"] = tab_idx
+            state["window_index"] = win_idx
+            state["session_id"] = sid
+            state["url"] = ""
+            _write_tab_state(state)
+            return (win_idx, tab_idx, sid)
+
+        # Validate stored index is in range
+        if stored_win >= win_count and win_count > 0:
+            if _session_name:
+                # Session window out of range — create new, never touch user tabs
+                win_idx, tab_idx, sid = _safari_create_new_tab()
+                state["tab_index"] = tab_idx
+                state["window_index"] = win_idx
+                state["session_id"] = sid
+                state["url"] = ""
+                _write_tab_state(state)
+                return (win_idx, tab_idx, sid)
+            return (0, 0, "")  # no session — legacy fallback
+    except (PwError, json.JSONDecodeError):
+        pass
+
+    # Final safety: if we have a named session and stored indices are both 0,
+    # verify it's actually our tab before using it
+    if _session_name and stored_win == 0 and stored_idx == 0:
+        try:
+            check = _jxa(f'''
+            var safari = Application("Safari");
+            var tab = safari.windows[0].tabs[0];
+            safari.doJavaScript("window.__pw_managed === true ? 'managed' : 'user'", {{in: tab}});
+            ''', timeout=3)
+            if check != "managed":
+                # Tab 0 is a user tab — create our own
+                win_idx, tab_idx, sid = _safari_create_new_tab()
+                if state:
+                    state["tab_index"] = tab_idx
+                    state["window_index"] = win_idx
+                    state["session_id"] = sid
+                    state["url"] = ""
+                    _write_tab_state(state)
+                return (win_idx, tab_idx, sid)
+        except PwError:
+            pass
+
+    return (stored_win, stored_idx, session_id)
+
+
+def safari_launch():
+    """Ensure Safari is running with a window (stays in background)."""
+    script = '''
+    var safari = Application("Safari");
+    safari.launch();
+    delay(0.3);
+    if (safari.windows.length === 0) {
+        safari.Document().make();
+        delay(0.3);
+    }
+    var win = safari.windows[0];
+    JSON.stringify({tabs: win.tabs.length, url: win.currentTab.url(), title: win.currentTab.name()});
+    '''
+    raw = _jxa(script)
+    info = json.loads(raw) if raw else {}
+    print(f"Safari ready. {info.get('tabs', '?')} tab(s) open.")
+    if info.get("url"):
+        print(f"Current: {info.get('title', '')} | {info['url']}")
+
+
+def safari_close():
+    """Clean up Safari state. With --name, close that session's tab and remove
+    only its state file. Without --name, scrub all state files (legacy behavior;
+    does not close any tab)."""
+    if _session_name:
+        path = _safari_session_file()
+        state = _read_tab_state()
+        if state is not None:
+            w = state.get("window_index", 0)
+            t = state.get("tab_index", 0)
+            try:
+                _jxa(
+                    f'var s = Application("Safari"); '
+                    f'try {{ s.windows[{w}].tabs[{t}].close(); }} catch(e) {{}}',
+                    timeout=5,
+                )
+            except PwError:
+                pass
+        if os.path.exists(path):
+            os.unlink(path)
+        print(f"Session {_session_name!r} closed.")
+        return
+
+    import glob as _glob
+    paths = [SAFARI_TAB_FILE]
+    paths += _glob.glob(os.path.join(STATE_DIR, "session-*.json"))
+    # Legacy path cleanup (pre-rename); harmless if nothing matches.
+    paths += _glob.glob("/tmp/pw-safari-session-*.json")
+    if os.path.exists("/tmp/pw-safari-tab"):
+        paths.append("/tmp/pw-safari-tab")
+    for path in paths:
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+    print("Safari state cleaned. (Safari left running)")
+
+
+def safari_status():
+    """Check if Safari is running."""
+    running = subprocess.run(["pgrep", "-x", "Safari"], capture_output=True).returncode == 0
+    if running:
+        try:
+            raw = _jxa('''
+            var safari = Application("Safari");
+            JSON.stringify({windows: safari.windows.length, tabs: safari.windows.length > 0 ? safari.windows[0].tabs.length : 0});
+            ''')
+            info = json.loads(raw)
+            print(f"Safari running. {info['windows']} window(s), {info['tabs']} tab(s).")
+        except PwError:
+            print("Safari running (could not query windows).")
+    else:
+        print("Safari not running.")
+
+
+def _safari_connect_and_run(fn):
+    """Connect to Safari and execute fn(browser, ctx, page).
+
+    Skips pgrep check — just tries JXA directly and recovers on error.
+    Uses session marker for robust tab tracking.
+
+    When a named session is active:
+    - First invocation creates a dedicated tab (never hijacks user's tab)
+    - If the session's tab is gone, creates a new one automatically
+    """
+    win_idx, tab_idx, session_id = _resolve_safari_tab(create_if_missing=True)
+    page = SafariPage(tab_idx, session_id=session_id or None, window_idx=win_idx)
+    ctx = _SafariCtx(window_idx=win_idx)
+
+    try:
+        return fn(None, ctx, page)
+    except PwError as e:
+        err = str(e)
+        # Tab gone (closed by user) — create a new one and retry
+        tab_gone_patterns = ["(-1719)", "Can't get tab"]
+        if _session_name and any(p in err for p in tab_gone_patterns):
+            new_win, new_tab, new_sid = _safari_create_new_tab()
+            page = SafariPage(new_tab, session_id=new_sid, window_idx=new_win)
+            ctx = _SafariCtx(window_idx=new_win)
+            _write_tab_state({
+                "session_id": new_sid,
+                "url": "",
+                "tab_index": new_tab,
+                "window_index": new_win,
+            })
+            return fn(None, ctx, page)
+        # Safari not running or no window — launch and retry once
+        recoverable = [
+            "(-1719)", "Can't get window", "windows doesn't understand",
+            "(-600)", "not running",
+        ]
+        if any(pattern in err for pattern in recoverable):
+            safari_launch()
+            page = SafariPage(0, session_id=session_id or None, window_idx=0)
+            ctx = _SafariCtx(window_idx=0)
+            return fn(None, ctx, page)
+        raise
+
+
+# ============================================================
+# Doctor command
+# ============================================================
+
+def cmd_doctor():
+    """Check Safari automation prerequisites."""
+    print("Safari automation setup check\n")
+    ok = True
+
+    # 1. Safari installed
+    safari_path = "/Applications/Safari.app"
+    if os.path.exists(safari_path):
+        print("  [ok] Safari installed")
+    else:
+        print("  [FAIL] Safari not found at /Applications/Safari.app")
+        ok = False
+
+    # 2. Automation permission (try to talk to Safari)
+    try:
+        _jxa('Application("Safari").name();')
+        print("  [ok] Automation permission granted")
+    except PwError as e:
+        if "not authorized" in str(e).lower() or "(-1743)" in str(e):
+            print("  [FAIL] Automation permission denied")
+            print("         → System Settings > Privacy & Security > Automation")
+            print("         → Enable your terminal for Safari")
+            ok = False
+        else:
+            print(f"  [ok] Can reach Safari (may need to approve dialog on first real use)")
+
+    # 3. Allow JavaScript from Apple Events
+    try:
+        _jxa('''
+        var safari = Application("Safari");
+        safari.launch();
+        delay(0.5);
+        if (safari.windows.length === 0) safari.Document().make();
+        delay(0.3);
+        safari.doJavaScript("1+1", {in: safari.windows[0].currentTab});
+        ''')
+        print("  [ok] 'Allow JavaScript from Apple Events' is enabled")
+    except PwError as e:
+        err = str(e)
+        if "apple events" in err.lower() or "(-1743)" in err:
+            print("  [FAIL] 'Allow JavaScript from Apple Events' is disabled")
+            print("         → Safari > Settings > Advanced > 'Show features for web developers'")
+            print("         → Safari > Settings > Developer > 'Allow JavaScript from Apple Events'")
+            ok = False
+        else:
+            print(f"  [warn] Could not verify JS permissions: {e}")
+
+    # 4. Accessibility (optional, for type/press)
+    try:
+        _jxa('''
+        Application("System Events").keystroke("");
+        "ok";
+        ''')
+        print("  [ok] Accessibility permission (for PW_KEYSTROKE=1 type/press)")
+    except PwError:
+        print("  [info] Accessibility permission not granted")
+        print("         → only needed if you set PW_KEYSTROKE=1 to force OS-level keystrokes")
+        print("         → System Settings > Privacy & Security > Accessibility > enable terminal")
+
+    print()
+    if ok:
+        print("Safari automation is ready! Use: pw nav <url>")
+    else:
+        print("Fix the issues above, then run 'pw doctor' again.")
+
+
+# ============================================================
+# Unified dispatcher
+# ============================================================
+
+def connect_and_run(fn):
+    """Connect to Safari and execute fn(browser, ctx, page)."""
+    return _safari_connect_and_run(fn)
+
+
+# --- Output flag helpers ---
+
+
+def _print_page_text(page, selector=None):
+    """Print page text (used by --text flag and cmd_text)."""
+    if selector:
+        el = page.query_selector(selector)
+        if not el:
+            raise PwError(f"Selector not found: {selector}")
+        print(el.inner_text())
+    else:
+        text = page.inner_text("body")
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        print("\n".join(lines[:200]))
+        if len(lines) > 200:
+            print(f"\n... ({len(lines) - 200} more lines, use a selector to narrow)")
+
+
+def _print_page_links(page, selector=None):
+    """Print page links (used by --links flag and cmd_links)."""
+    if selector:
+        safe_sel = _json_escape(selector + " a")
+        container = f"document.querySelectorAll({safe_sel})"
+    else:
+        container = 'document.querySelectorAll("a")'
+    links = page.evaluate(f"""
+        Array.from({container}).map(a => ({{
+            text: a.innerText.trim().substring(0, 80),
+            href: a.href
+        }})).filter(l => l.href && l.href !== 'javascript:void(0)')
+    """)
+    if not links:
+        links = []
+    for i, link in enumerate(links[:100]):
+        text = link["text"] or "(no text)"
+        print(f"[{i}] {text} → {link['href']}")
+    if len(links) > 100:
+        print(f"\n... ({len(links) - 100} more links)")
+
+
+def _print_page_html(page, selector=None):
+    """Print page HTML (used by --html flag and cmd_html)."""
+    if selector:
+        el = page.query_selector(selector)
+        if not el:
+            raise PwError(f"Selector not found: {selector}")
+        print(el.inner_html())
+    else:
+        html = page.content()
+        if len(html) > 50000:
+            print(html[:50000])
+            print(f"\n... (truncated, {len(html)} total chars)")
+        else:
+            print(html)
+
+
+def _handle_output_flag(page, output_flag, output_selector=None):
+    """Handle --text/--links/--html output flags after an action."""
+    if not output_flag:
+        return
+    print("---")
+    if output_flag == "text":
+        _print_page_text(page, output_selector)
+    elif output_flag == "links":
+        _print_page_links(page, output_selector)
+    elif output_flag == "html":
+        _print_page_html(page, output_selector)
+
+
+def _parse_output_flags(args):
+    """Extract --text/--links/--html/--quiet from args. Returns (clean_args, flag, flag_selector).
+
+    --quiet suppresses the default auto-text output (returns flag=None).
+    """
+    flag = None
+    flag_selector = None
+    explicit = False  # True if user explicitly set a flag
+    quiet = False
+    clean = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--quiet":
+            quiet = True
+            i += 1
+            continue
+        if args[i] in ("--text", "--links", "--html"):
+            flag = args[i][2:]  # strip --
+            explicit = True
+            # Check if next arg is a selector (not another flag or option)
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                flag_selector = args[i + 1]
+                i += 2
+                continue
+            i += 1
+            continue
+        clean.append(args[i])
+        i += 1
+    if quiet and not explicit:
+        flag = False  # False = explicitly no output (distinct from None = not specified)
+    return clean, flag, flag_selector
+
+
+# --- Commands ---
+
+
+def cmd_nav(url, output_flag="text", output_selector=None, dismiss=False):
+    if not url.startswith(("http://", "https://", "file://")):
+        url = "https://" + url
+
+    def do(browser, ctx, page):
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        if dismiss and hasattr(page, 'dismiss_popups'):
+            time.sleep(1)
+            page.dismiss_popups()
+        print(f"{page.title()}\n{page.url}")
+        _handle_output_flag(page, output_flag, output_selector)
+
+    connect_and_run(do)
+
+
+def cmd_dismiss():
+    """Dismiss common popups, cookie banners, and marketing modals."""
+    def do(browser, ctx, page):
+        result = page.dismiss_popups()
+        print(result)
+
+    connect_and_run(do)
+
+
+def cmd_click(selector, output_flag="text", output_selector=None):
+    def do(browser, ctx, page):
+        page.click(selector, timeout=5000)
+        page.wait_for_load_state("domcontentloaded", timeout=5000)
+        print(f"Clicked: {selector}\nPage: {page.title()} | {page.url}")
+        _handle_output_flag(page, output_flag, output_selector)
+
+    connect_and_run(do)
+
+
+
+def cmd_react_click(selector, output_flag="text", output_selector=None):
+    """Click an element via React fiber handlers (background-safe)."""
+    def do(browser, ctx, page):
+        method = page.react_click(selector, timeout=5000)
+        print(f"React-clicked: {selector} [{method}]\nPage: {page.title()} | {page.url}")
+        _handle_output_flag(page, output_flag, output_selector)
+
+    connect_and_run(do)
+
+
+def cmd_react_set(selector, prop, value):
+    """Set a React component prop by invoking its handler directly."""
+    def do(browser, ctx, page):
+        result = page.react_set(selector, prop, value, timeout=5000)
+        print(f"React-set: {selector} {prop}={value}")
+        if result:
+            print(f"  Result: {result}")
+
+    connect_and_run(do)
+
+def cmd_search(selector, text):
+    def do(browser, ctx, page):
+        result = page.fill_search(selector, text, timeout=10000)
+        print(f"Search: '{text}' via '{selector}'")
+        if result:
+            print(f"  Result: {result}")
+
+    connect_and_run(do)
+
+
+def cmd_fill(selector, text):
+    def do(browser, ctx, page):
+        page.fill(selector, text, timeout=5000)
+        print(f"Filled '{selector}' with '{text}'")
+
+    connect_and_run(do)
+
+
+def cmd_type(text):
+    def do(browser, ctx, page):
+        page.keyboard.type(text)
+        print(f"Typed: {text}")
+
+    connect_and_run(do)
+
+
+def cmd_press(key):
+    def do(browser, ctx, page):
+        page.keyboard.press(key)
+        print(f"Pressed: {key}")
+
+    connect_and_run(do)
+
+
+def cmd_select(selector, value):
+    def do(browser, ctx, page):
+        page.select_option(selector, value, timeout=5000)
+        print(f"Selected '{value}' in '{selector}'")
+
+    connect_and_run(do)
+
+
+def cmd_screenshot(path=None):
+    path = path or SCREENSHOT_DEFAULT
+
+    def do(browser, ctx, page):
+        page.screenshot(path=path, full_page=False)
+        print(f"Screenshot saved: {path}")
+
+    connect_and_run(do)
+
+
+def cmd_text(selector=None):
+    def do(browser, ctx, page):
+        _print_page_text(page, selector)
+
+    connect_and_run(do)
+
+
+def cmd_html(selector=None):
+    def do(browser, ctx, page):
+        _print_page_html(page, selector)
+
+    connect_and_run(do)
+
+
+def cmd_eval(js):
+    def do(browser, ctx, page):
+        result = page.evaluate(js)
+        if isinstance(result, (dict, list)):
+            print(json.dumps(result, indent=2, default=str))
+        elif result is None:
+            print("null")
+        else:
+            print(result)
+
+    connect_and_run(do)
+
+
+def cmd_title():
+    def do(browser, ctx, page):
+        print(page.title())
+
+    connect_and_run(do)
+
+
+def cmd_url():
+    def do(browser, ctx, page):
+        print(page.url)
+
+    connect_and_run(do)
+
+
+def cmd_snap():
+    """Fast page state: title + URL + text in one call."""
+    def do(browser, ctx, page):
+        # Single JS call to get everything at once
+        data = page.evaluate('''({
+            title: document.title,
+            url: location.href,
+            text: document.body ? document.body.innerText.substring(0, 50000) : ""
+        })''')
+        if data:
+            print(f"{data.get('title', '')}\n{data.get('url', '')}\n---")
+            text = data.get("text", "")
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            print("\n".join(lines[:200]))
+            if len(lines) > 200:
+                print(f"\n... ({len(lines) - 200} more lines)")
+        else:
+            print(f"{page.title()}\n{page.url}")
+
+    connect_and_run(do)
+
+
+def cmd_links(selector=None):
+    def do(browser, ctx, page):
+        _print_page_links(page, selector)
+
+    connect_and_run(do)
+
+
+def cmd_wait(selector):
+    def do(browser, ctx, page):
+        page.wait_for_selector(selector, timeout=10000)
+        print(f"Found: {selector}")
+
+    connect_and_run(do)
+
+
+def cmd_tabs():
+    def do(browser, ctx, page):
+        active_idx = page._tab if hasattr(page, '_tab') else -1
+        for i, p in enumerate(ctx.pages):
+            marker = " *" if (i == active_idx if active_idx >= 0 else p == page) else ""
+            print(f"[{i}] {p.title()} | {p.url}{marker}")
+
+    connect_and_run(do)
+
+
+def cmd_tab(index):
+    def do(browser, ctx, page):
+        pages = ctx.pages
+        idx = int(index)
+        if idx < 0 or idx >= len(pages):
+            raise PwError(f"Tab {idx} not found. {len(pages)} tabs open.")
+        pages[idx].bring_to_front()
+        _write_tab_state({
+            "session_id": page._session_id if hasattr(page, '_session_id') else "",
+            "url": pages[idx].url,
+            "tab_index": idx,
+            "window_index": page._win if hasattr(page, '_win') else 0,
+        })
+        print(f"Switched to tab {idx}: {pages[idx].title()} | {pages[idx].url}")
+
+    connect_and_run(do)
+
+
+def cmd_back(output_flag="text", output_selector=None):
+    def do(browser, ctx, page):
+        try:
+            page.go_back(wait_until="domcontentloaded", timeout=5000)
+        except PwError:
+            pass  # JXA timeout — non-fatal for back navigation
+        except Exception as e:
+            if "Timeout" in type(e).__name__:
+                pass  # timeout — non-fatal
+            else:
+                raise
+        print(f"{page.title()}\n{page.url}")
+        _handle_output_flag(page, output_flag, output_selector)
+
+    connect_and_run(do)
+
+
+def cmd_close():
+    safari_close()
+
+
+def cmd_status():
+    safari_status()
+
+
+# --- Argument validation & dispatch ---
+
+
+def _nav_handler(args):
+    dismiss = "--dismiss" in args
+    args = [a for a in args if a != "--dismiss"]
+    clean, flag, flag_sel = _parse_output_flags(args)
+    # None = not specified (use default "text"), False = --quiet (no output)
+    output = flag if flag is not None else "text"
+    if output is False:
+        output = None
+    cmd_nav(clean[0] if clean else "about:blank", output_flag=output, output_selector=flag_sel, dismiss=dismiss)
+
+
+def _click_handler(args):
+    clean, flag, flag_sel = _parse_output_flags(args)
+    if not clean:
+        raise PwError("Usage: pw click SELECTOR [--text|--links|--html [SEL]]")
+    output = flag if flag is not None else "text"
+    if output is False:
+        output = None
+    cmd_click(clean[0], output_flag=output, output_selector=flag_sel)
+
+
+
+def _react_click_handler(args):
+    clean, flag, flag_sel = _parse_output_flags(args)
+    if not clean:
+        raise PwError("Usage: pw react-click SELECTOR [--text|--links|--html [SEL]]")
+    output = flag if flag is not None else "text"
+    if output is False:
+        output = None
+    cmd_react_click(clean[0], output_flag=output, output_selector=flag_sel)
+
+
+def _react_set_handler(args):
+    if len(args) < 3:
+        raise PwError("Usage: pw react-set SELECTOR PROP VALUE")
+    cmd_react_set(args[0], args[1], args[2])
+
+def _back_handler(args):
+    clean, flag, flag_sel = _parse_output_flags(args)
+    output = flag if flag is not None else "text"
+    if output is False:
+        output = None
+    cmd_back(output_flag=output, output_selector=flag_sel)
+
+
+# ============================================================
+# Batch command
+# ============================================================
+
+def _parse_batch_command(cmd_str):
+    """Parse a batch command string into (command_name, args_list).
+
+    Supports quoted arguments: 'fill #name "Jane Doe"'
+    For eval, the JS expression is kept as a single string to preserve
+    quotes and special characters: 'eval document.querySelectorAll("input")'
+    Raises ValueError for empty, unknown, or under-specified commands.
+    """
+    import shlex
+    cmd_str = cmd_str.strip()
+    if not cmd_str:
+        raise ValueError("Empty batch command")
+    # Split off just the command name first
+    first_space = cmd_str.find(" ")
+    if first_space < 0:
+        cmd = cmd_str
+        args = []
+    else:
+        cmd = cmd_str[:first_space]
+        rest = cmd_str[first_space + 1:].strip()
+        # For eval and type, keep the rest as a single argument to preserve
+        # JS syntax (quotes, parens, etc.)
+        if cmd in ("eval", "type") and rest:
+            args = [rest]
+        elif rest:
+            args = shlex.split(rest)
+        else:
+            args = []
+    if cmd not in COMMANDS and cmd != "batch":
+        raise PwError(f"Unknown command in batch: {cmd}")
+    if cmd == "batch":
+        raise PwError("Cannot nest batch commands")
+    spec = COMMANDS[cmd]
+    if len(args) < spec["min_args"]:
+        raise PwError(
+            f"Command '{cmd}' requires at least {spec['min_args']} arg(s), "
+            f"got {len(args)}. {spec.get('usage', '')}"
+        )
+    return cmd, args
+
+
+def _execute_batch_step(page, cmd, args):
+    """Execute a single batch step against an existing page connection."""
+    if cmd == "nav":
+        clean, flag, flag_sel = _parse_output_flags(args)
+        if not clean:
+            raise PwError("nav requires a URL")
+        url = clean[0]
+        if not url.startswith(("http://", "https://", "file://")):
+            url = "https://" + url
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        output = flag if flag is not None else "text"
+        if output is False:
+            output = None
+        print(f"{page.title()}\n{page.url}")
+        if output:
+            _handle_output_flag(page, output, flag_sel)
+    elif cmd == "click":
+        clean, flag, flag_sel = _parse_output_flags(args)
+        if not clean:
+            raise PwError("click requires a SELECTOR")
+        page.click(clean[0], timeout=5000)
+        page.wait_for_load_state("domcontentloaded", timeout=5000)
+        output = flag if flag is not None else None  # quiet by default in batch
+        print(f"Clicked: {clean[0]}")
+        if output:
+            _handle_output_flag(page, output, flag_sel)
+    elif cmd == "react-click":
+        clean, flag, flag_sel = _parse_output_flags(args)
+        if not clean:
+            raise PwError("react-click requires a SELECTOR")
+        method = page.react_click(clean[0], timeout=5000)
+        output = flag if flag is not None else None
+        print(f"React-clicked: {clean[0]} [{method}]")
+        if output:
+            _handle_output_flag(page, output, flag_sel)
+    elif cmd == "react-set":
+        if len(args) < 3:
+            raise PwError("react-set requires SELECTOR PROP VALUE")
+        result = page.react_set(args[0], args[1], args[2], timeout=5000)
+        print(f"React-set: {args[0]} {args[1]}={args[2]}")
+        if result:
+            print(f"  Result: {result}")
+    elif cmd == "fill":
+        page.fill(args[0], args[1], timeout=5000)
+        print(f"Filled '{args[0]}' with '{args[1]}'")
+    elif cmd == "select":
+        page.select_option(args[0], args[1], timeout=5000)
+        print(f"Selected '{args[1]}' in '{args[0]}'")
+    elif cmd == "type":
+        page.keyboard.type(" ".join(args))
+        print(f"Typed: {' '.join(args)}")
+    elif cmd == "press":
+        page.keyboard.press(args[0])
+        print(f"Pressed: {args[0]}")
+    elif cmd == "eval":
+        js = " ".join(args)
+        result = page.evaluate(js)
+        if isinstance(result, (dict, list)):
+            print(json.dumps(result, indent=2))
+        elif result is not None:
+            print(result)
+        else:
+            print("null")
+    elif cmd == "text":
+        sel = args[0] if args else None
+        _print_page_text(page, sel)
+    elif cmd == "html":
+        sel = args[0] if args else None
+        _print_page_html(page, sel)
+    elif cmd == "title":
+        print(page.title())
+    elif cmd == "url":
+        print(page.url)
+    elif cmd == "links":
+        sel = args[0] if args else None
+        _print_page_links(page, sel)
+    elif cmd == "wait":
+        page.wait_for_selector(args[0], timeout=10000)
+        print(f"Found: {args[0]}")
+    elif cmd == "screenshot":
+        path = args[0] if args else SCREENSHOT_DEFAULT
+        page.screenshot(path=path)
+        print(f"Screenshot saved: {path}")
+    else:
+        raise PwError(f"Command '{cmd}' not supported in batch mode")
+
+
+def cmd_batch(command_strings):
+    """Execute multiple commands in a single browser connection.
+
+    This avoids the ~200ms Python startup overhead per command, making
+    multi-step workflows significantly faster.
+    """
+    # Pre-parse all commands to fail fast on syntax errors
+    parsed = []
+    for i, cs in enumerate(command_strings, 1):
+        try:
+            cmd, args = _parse_batch_command(cs)
+            parsed.append((i, cmd, args, cs))
+        except (PwError, ValueError) as e:
+            raise PwError(f"Batch step {i} ({cs!r}): {e}")
+
+    def do(browser, ctx, page):
+        for step_num, cmd, args, raw in parsed:
+            try:
+                print(f"[{step_num}/{len(parsed)}] {raw}")
+                _execute_batch_step(page, cmd, args)
+            except PwError as e:
+                print(f"Error at step {step_num} ({raw!r}): {e}", file=sys.stderr)
+                raise
+
+    connect_and_run(do)
+
+
+COMMANDS = {
+    "launch":     {"handler": lambda args: safari_launch(), "min_args": 0},
+    "nav":        {"handler": _nav_handler,                            "min_args": 0},
+    "click":        {"handler": _click_handler,                          "min_args": 1, "usage": "pw click SELECTOR [--text|--links|--html [SEL]]"},
+    "react-click":  {"handler": _react_click_handler,                    "min_args": 1, "usage": "pw react-click SELECTOR [--text|--links|--html [SEL]]"},
+    "react-set":    {"handler": _react_set_handler,                      "min_args": 3, "usage": "pw react-set SELECTOR PROP VALUE"},
+    "search":     {"handler": lambda args: cmd_search(args[0], " ".join(args[1:])), "min_args": 2, "usage": "pw search SELECTOR TEXT — click search trigger, fill modal input, press Enter"},
+    "fill":       {"handler": lambda args: cmd_fill(args[0], args[1]), "min_args": 2, "usage": "pw fill SELECTOR TEXT"},
+    "type":       {"handler": lambda args: cmd_type(" ".join(args)),   "min_args": 1, "usage": "pw type TEXT"},
+    "press":      {"handler": lambda args: cmd_press(args[0]),         "min_args": 1, "usage": "pw press KEY"},
+    "select":     {"handler": lambda args: cmd_select(args[0], args[1]), "min_args": 2, "usage": "pw select SELECTOR VALUE"},
+    "screenshot": {"handler": lambda args: cmd_screenshot(args[0] if args else None), "min_args": 0},
+    "snap":       {"handler": lambda args: cmd_snap(),                 "min_args": 0},
+    "text":       {"handler": lambda args: cmd_text(args[0] if args else None), "min_args": 0},
+    "html":       {"handler": lambda args: cmd_html(args[0] if args else None), "min_args": 0},
+    "eval":       {"handler": lambda args: cmd_eval(" ".join(args)),   "min_args": 1, "usage": "pw eval JS"},
+    "title":      {"handler": lambda args: cmd_title(),                "min_args": 0},
+    "url":        {"handler": lambda args: cmd_url(),                  "min_args": 0},
+    "links":      {"handler": lambda args: cmd_links(args[0] if args else None), "min_args": 0},
+    "wait":       {"handler": lambda args: cmd_wait(args[0]),          "min_args": 1, "usage": "pw wait SELECTOR"},
+    "tabs":       {"handler": lambda args: cmd_tabs(),                 "min_args": 0},
+    "tab":        {"handler": lambda args: cmd_tab(args[0]),           "min_args": 1, "usage": "pw tab INDEX"},
+    "back":       {"handler": _back_handler,                           "min_args": 0},
+    "close":      {"handler": lambda args: cmd_close(),                "min_args": 0},
+    "status":     {"handler": lambda args: cmd_status(),               "min_args": 0},
+    "doctor":     {"handler": lambda args: cmd_doctor(),               "min_args": 0},
+    "batch":      {"handler": lambda args: cmd_batch(args),            "min_args": 1, "usage": "pw batch \"CMD1\" \"CMD2\" ..."},
+    "dismiss":    {"handler": lambda args: cmd_dismiss(),              "min_args": 0},
+}
+
+
+def main():
+    global _session_name
+
+    argv = sys.argv[1:]
+
+    # Parse --name flag for named sessions (multi-agent support)
+    raw_session = None
+    if "--name" in argv:
+        idx = argv.index("--name")
+        if idx + 1 < len(argv):
+            raw_session = argv[idx + 1]
+            argv = argv[:idx] + argv[idx + 2:]
+        else:
+            print("Error: --name requires a session name", file=sys.stderr)
+            sys.exit(1)
+    elif os.environ.get("PW_SESSION"):
+        raw_session = os.environ["PW_SESSION"]
+
+    # Auto-session: when running inside Claude Code and no explicit session,
+    # default to "claude" session to avoid hijacking user tabs
+    if raw_session is None and os.environ.get("CLAUDE_CODE"):
+        raw_session = "claude"
+
+    if raw_session is not None:
+        try:
+            _session_name = _safe_session_name(raw_session)
+        except PwError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
+
+    if not argv:
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = argv[0]
+    args = argv[1:]
+
+    if cmd not in COMMANDS:
+        print(f"Unknown command: {cmd}\n", file=sys.stderr)
+        print(__doc__)
+        sys.exit(1)
+
+    spec = COMMANDS[cmd]
+    if len(args) < spec["min_args"]:
+        print(f"Usage: {spec.get('usage', 'pw ' + cmd)}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        spec["handler"](args)
+    except PwError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

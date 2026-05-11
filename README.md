@@ -62,6 +62,33 @@ It will tell you which (if any) Safari permissions you need to enable. There are
 
 That's it. No Homebrew tap, no `pip install`, no browser download.
 
+### Installing the `/pw` skill for Claude Code
+
+The repo ships a slash-command skill at [`skill/pw.md`](skill/pw.md). To install it for Claude Code:
+
+```bash
+# Symlink into ~/.claude/commands (slash commands live here)
+ln -s "$PWD/safari-pw/skill/pw.md" ~/.claude/commands/pw.md
+
+# Or copy if you'd rather not symlink
+cp safari-pw/skill/pw.md ~/.claude/commands/pw.md
+```
+
+Restart Claude Code (or open a new session) and `/pw` will appear in the skill list. The skill assumes `pw` is on your `PATH` — verify with `which pw`.
+
+### Installing for Codex CLI
+
+Codex doesn't have a built-in slash-command directory the way Claude Code does, but it picks up tool guidance from `AGENTS.md` files. Either:
+
+- Add a section to your project's `AGENTS.md` (or `~/.codex/AGENTS.md` for global) pointing at the `pw` binary and summarizing common commands, or
+- Paste the contents of `skill/pw.md` (stripping the frontmatter) into your project `AGENTS.md`.
+
+Codex will then know to invoke `pw nav`, `pw snap`, etc. when it needs a browser.
+
+### Other agents
+
+The `skill/pw.md` body (frontmatter stripped) is plain instructional Markdown — drop it into any agent's system prompt, tool description, or context file. The CLI itself is provider-agnostic; the skill file just teaches an LLM when and how to call it.
+
 ## Usage
 
 ```bash

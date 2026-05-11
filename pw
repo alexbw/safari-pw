@@ -286,10 +286,27 @@ def _build_tab_finder_jxa(session_id, hint_win=0, hint_tab=0):
             if (__pw_tab) break;
         }}
     }}
-    // Fallback: use hinted indices
+    // Fallback: hinted indices if in range, else frontmost window's current
+    // tab. Never throw — callers may continue to operate on whatever tab we
+    // hand back (e.g. screenshot of the wrong-but-real Safari window beats
+    // a JXA exception, which the Python layer would convert into a
+    // full-screen capture and leak unrelated content).
     if (!__pw_tab) {{
-        __pw_win = safari.windows[{hint_win}];
-        __pw_tab = __pw_win.tabs[{hint_tab}];
+        try {{
+            if ({hint_win} < safari.windows.length) {{
+                __pw_win = safari.windows[{hint_win}];
+                if ({hint_tab} < __pw_win.tabs.length) {{
+                    __pw_tab = __pw_win.tabs[{hint_tab}];
+                }}
+            }}
+        }} catch(e) {{}}
+        if (!__pw_tab && safari.windows.length > 0) {{
+            __pw_win = safari.windows[0];
+            try {{ __pw_tab = __pw_win.currentTab(); }} catch(e) {{}}
+            if (!__pw_tab && __pw_win.tabs.length > 0) {{
+                __pw_tab = __pw_win.tabs[0];
+            }}
+        }}
     }}
     '''
 
@@ -638,9 +655,15 @@ class SafariPage:
             self._last_nav = json.loads(raw) if raw else {}
         except (json.JSONDecodeError, TypeError):
             self._last_nav = {}
-        # Inject session marker and managed flag for tab tracking
+        # Inject session marker and managed flag for tab tracking.
+        # _do_js wraps the JS in `return ...;` so we MUST pass a single
+        # expression — multi-statement JS only runs its first statement
+        # before the return. Use a comma expression to set both fields.
         try:
-            self._do_js(f'window.__pw_session_id = {_js_escape(self._session_id)}; window.__pw_managed = true;')
+            self._do_js(
+                f'(window.__pw_session_id = {_js_escape(self._session_id)}, '
+                f'window.__pw_managed = true, true)'
+            )
         except PwError:
             pass
         # Persist tab state
@@ -1126,51 +1149,67 @@ class SafariPage:
         # background. We switch the pw tab to be Safari's currentTab (so
         # the right page is in the backing buffer), capture, then restore
         # the user's original tab. No safari.activate() — fully backgrounded.
-        original_tab = 0
-        try:
-            info_raw = _jxa(f'''
-            var safari = Application("Safari");
-            {self._find_tab_jxa()}
-            var win = __pw_win;
+        #
+        # Every step is wrapped in try/catch on the JXA side. We must NEVER
+        # fall back to a full-screen `screencapture -x` without a window id:
+        # that captures whatever app happens to be frontmost (terminal, an
+        # email window, anything) and silently leaks unrelated content as
+        # what looked like a Safari screenshot.
+        info_raw = _jxa(f'''
+        var safari = Application("Safari");
+        {self._find_tab_jxa()}
+        var win = __pw_win;
+        var winId = null, origIdx = 0;
+        try {{ winId = win.id(); }} catch(e) {{}}
+        try {{
             var cur = win.currentTab();
-            var origIdx = 0;
             for (var i = 0; i < win.tabs.length; i++) {{
                 if (win.tabs[i].id() === cur.id()) {{ origIdx = i; break; }}
             }}
-            win.currentTab = __pw_tab;
-            JSON.stringify({{windowId: win.id(), originalTab: origIdx}});
-            ''')
+        }} catch(e) {{}}
+        try {{ if (__pw_tab) win.currentTab = __pw_tab; }} catch(e) {{}}
+        JSON.stringify({{windowId: winId, originalTab: origIdx}});
+        ''')
+        try:
             info = json.loads(info_raw) if info_raw else {}
-            win_id = str(info.get("windowId", ""))
-            original_tab = _coerce_index(info.get("originalTab", 0))
-            if win_id and win_id.isdigit():
-                subprocess.run(
-                    ["screencapture", f"-l{win_id}", "-x", path],
-                    capture_output=True, timeout=10,
-                )
-                # Note: window-server capture works in the background even when
-                # Safari is occluded or minimized. We deliberately do NOT fall
-                # back to safari.activate() if the file looks small — sparse
-                # pages legitimately compress below any size threshold, and
-                # foregrounding Safari while the user is in another app is
-                # disruptive. If the capture genuinely failed, the file will
-                # be missing, not just small; surface that to the caller.
-                if not os.path.exists(path):
-                    print(
-                        f"pw: screenshot capture failed for window {win_id}",
-                        file=sys.stderr,
-                    )
-            else:
-                subprocess.run(["screencapture", "-x", path], capture_output=True, timeout=10)
-        except (PwError, json.JSONDecodeError):
-            # Fallback: full-screen capture
-            subprocess.run(["screencapture", "-x", path], capture_output=True, timeout=10)
+        except json.JSONDecodeError:
+            info = {}
+        win_id_raw = info.get("windowId")
+        original_tab = _coerce_index(info.get("originalTab", 0))
+        win_id = str(win_id_raw) if win_id_raw is not None else ""
+        if not win_id or not win_id.isdigit():
+            raise PwError(
+                "screenshot failed: could not resolve a Safari window id "
+                "(Safari may have no windows open). Refusing to fall back to "
+                "a full-screen capture — that would leak whatever app is "
+                "frontmost."
+            )
+        # Remove any stale file at the path so a missing file genuinely
+        # indicates capture failure (vs. capture-ran-but-overwrote-nothing).
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        subprocess.run(
+            ["screencapture", f"-l{win_id}", "-x", path],
+            capture_output=True, timeout=10,
+        )
+        if not os.path.exists(path):
+            raise PwError(
+                f"screenshot capture failed for Safari window {win_id} "
+                f"(no file written to {path})"
+            )
         # Restore user's original tab (use finder to get the right window).
         # If this fails we tell the user — silent failure here would leave
         # them looking at the pw tab without explanation.
         try:
             finder = self._find_tab_jxa()
-            _jxa(f'var safari = Application("Safari"); {finder} __pw_win.currentTab = __pw_win.tabs[{original_tab}];')
+            _jxa(
+                f'var safari = Application("Safari"); {finder} '
+                f'try {{ __pw_win.currentTab = __pw_win.tabs[{original_tab}]; }} catch(e) {{}}'
+            )
         except PwError as e:
             print(f"pw: warning — could not restore your Safari tab: {e}", file=sys.stderr)
 
@@ -1397,8 +1436,19 @@ def _safari_tab_index():
 
 
 def _new_session_id():
-    """Mint a unique pw session id."""
+    """Mint a pw session id.
+
+    For named sessions (--name / PW_SESSION), the id is deterministic from
+    the name. That way repeated invocations of the same name resolve to the
+    same managed tab via the JS marker, even if state files are lost or the
+    tab indices drift. Without this, every recovery path mints a fresh id,
+    orphaning any placeholder tabs created under the previous one.
+
+    Unnamed sessions still get a unique per-process id.
+    """
     global _session_counter
+    if _session_name:
+        return f"pw_named_{_session_name}"
     _session_counter += 1
     return f"pw_{os.getpid()}_{int(time.time() * 1000) % 1000000}_{_session_counter}"
 
@@ -1501,24 +1551,43 @@ def _resolve_safari_tab(create_if_missing=False):
     stored_idx = state.get("tab_index", 0)
     stored_win = state.get("window_index", 0)
 
-    if not session_id and not stored_url:
+    # For named sessions, also accept the deterministic marker. State files
+    # written before deterministic sids existed have random ids; both should
+    # resolve to the same tab.
+    sid_candidates = []
+    if session_id:
+        sid_candidates.append(session_id)
+    if _session_name:
+        det_sid = f"pw_named_{_session_name}"
+        if det_sid not in sid_candidates:
+            sid_candidates.append(det_sid)
+
+    if not sid_candidates and not stored_url:
         return (stored_win, stored_idx, session_id)
 
     # Scan ALL windows and tabs for session marker, then URL
     scan_js = f'''
     var safari = Application("Safari");
-    var markerWin = -1, markerTab = -1;
+    var markerWin = -1, markerTab = -1, markerSid = "";
     var urlWin = -1, urlTab = -1;
-    var targetSid = {json.dumps(session_id)};
+    var sidCandidates = {json.dumps(sid_candidates)};
     var targetUrl = {json.dumps(stored_url)};
     var winCount = safari.windows.length;
     for (var w = 0; w < winCount; w++) {{
         var tabCount = safari.windows[w].tabs.length;
         for (var t = 0; t < tabCount; t++) {{
             try {{
-                if (targetSid && markerWin < 0) {{
+                if (sidCandidates.length > 0 && markerWin < 0) {{
                     var sid = safari.doJavaScript("window.__pw_session_id || ''", {{in: safari.windows[w].tabs[t]}});
-                    if (sid === targetSid) {{ markerWin = w; markerTab = t; break; }}
+                    if (sid) {{
+                        for (var i = 0; i < sidCandidates.length; i++) {{
+                            if (sid === sidCandidates[i]) {{
+                                markerWin = w; markerTab = t; markerSid = sid;
+                                break;
+                            }}
+                        }}
+                        if (markerWin >= 0) break;
+                    }}
                 }}
             }} catch(e) {{}}
             try {{
@@ -1530,23 +1599,35 @@ def _resolve_safari_tab(create_if_missing=False):
         }}
         if (markerWin >= 0) break;
     }}
-    JSON.stringify({{markerWin: markerWin, markerTab: markerTab, urlWin: urlWin, urlTab: urlTab, winCount: winCount}});
+    JSON.stringify({{markerWin: markerWin, markerTab: markerTab, markerSid: markerSid, urlWin: urlWin, urlTab: urlTab, winCount: winCount}});
     '''
     try:
         raw = _jxa(scan_js, timeout=15)
         result = json.loads(raw) if raw else {}
         marker_win = result.get("markerWin", -1)
         marker_tab = result.get("markerTab", -1)
+        marker_sid = result.get("markerSid", "") or session_id
         url_win = result.get("urlWin", -1)
         url_tab = result.get("urlTab", -1)
         win_count = result.get("winCount", 0)
 
         if marker_win >= 0 and marker_tab >= 0:
-            if marker_win != stored_win or marker_tab != stored_idx:
+            # If we found the tab under a different sid (e.g. legacy random
+            # sid in state vs. deterministic marker on the tab), upgrade
+            # state to the marker we actually found so subsequent scans
+            # stay consistent.
+            new_state_needed = (
+                marker_win != stored_win
+                or marker_tab != stored_idx
+                or (marker_sid and marker_sid != session_id)
+            )
+            if new_state_needed:
                 state["tab_index"] = marker_tab
                 state["window_index"] = marker_win
+                if marker_sid:
+                    state["session_id"] = marker_sid
                 _write_tab_state(state)
-            return (marker_win, marker_tab, session_id)
+            return (marker_win, marker_tab, marker_sid)
         if url_win >= 0 and url_tab >= 0:
             if url_win != stored_win or url_tab != stored_idx:
                 state["tab_index"] = url_tab
@@ -1630,21 +1711,73 @@ def safari_close():
     does not close any tab)."""
     if _session_name:
         path = _safari_session_file()
+        # Close by marker, not by stored index. Indices drift as the user
+        # opens/closes tabs, so the state file's tab_index can point at an
+        # unrelated user tab by the time `close` runs. Scanning for the
+        # deterministic session marker also sweeps up any orphan placeholder
+        # tabs created by earlier failed-resolution paths.
+        deterministic_sid = f"pw_named_{_session_name}"
         state = _read_tab_state()
-        if state is not None:
-            w = state.get("window_index", 0)
-            t = state.get("tab_index", 0)
-            try:
-                _jxa(
-                    f'var s = Application("Safari"); '
-                    f'try {{ s.windows[{w}].tabs[{t}].close(); }} catch(e) {{}}',
-                    timeout=5,
-                )
-            except PwError:
-                pass
+        stored_sid = state.get("session_id", "") if state else ""
+        stored_url = state.get("url", "") if state else ""
+        # Match both deterministic and any legacy/random sid stored in state.
+        sid_targets = [deterministic_sid]
+        if stored_sid and stored_sid != deterministic_sid:
+            sid_targets.append(stored_sid)
+        sid_targets_js = json.dumps(sid_targets)
+        url_target_js = json.dumps(stored_url)
+        try:
+            raw = _jxa(f'''
+            var safari = Application("Safari");
+            var sidTargets = {sid_targets_js};
+            var urlTarget = {url_target_js};
+            var closed = 0;
+            for (var w = 0; w < safari.windows.length; w++) {{
+                // Iterate backwards so closing doesn't shift indices we
+                // haven't visited yet.
+                for (var t = safari.windows[w].tabs.length - 1; t >= 0; t--) {{
+                    var matchedBySid = false, matchedByUrl = false;
+                    try {{
+                        var sid = safari.doJavaScript(
+                            "window.__pw_session_id || ''",
+                            {{in: safari.windows[w].tabs[t]}}
+                        );
+                        for (var i = 0; i < sidTargets.length; i++) {{
+                            if (sid && sid === sidTargets[i]) {{
+                                matchedBySid = true;
+                                break;
+                            }}
+                        }}
+                    }} catch(e) {{}}
+                    // Also match the data: placeholder URLs that bake the
+                    // sid into HTML — they may have been created before any
+                    // marker injection ran.
+                    try {{
+                        var url = safari.windows[w].tabs[t].url();
+                        if (url && url.indexOf("data:text/html") === 0) {{
+                            for (var j = 0; j < sidTargets.length; j++) {{
+                                if (url.indexOf(sidTargets[j]) >= 0) {{
+                                    matchedByUrl = true;
+                                    break;
+                                }}
+                            }}
+                        }}
+                    }} catch(e) {{}}
+                    if (matchedBySid || matchedByUrl) {{
+                        try {{ safari.windows[w].tabs[t].close(); closed++; }}
+                        catch(e) {{}}
+                    }}
+                }}
+            }}
+            JSON.stringify({{closed: closed}});
+            ''', timeout=10)
+            result = json.loads(raw) if raw else {}
+            closed = result.get("closed", 0)
+        except (PwError, json.JSONDecodeError):
+            closed = 0
         if os.path.exists(path):
             os.unlink(path)
-        print(f"Session {_session_name!r} closed.")
+        print(f"Session {_session_name!r} closed. ({closed} tab(s) removed)")
         return
 
     import glob as _glob

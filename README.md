@@ -148,6 +148,17 @@ pw react-click "button.complicated"
 pw react-set "input.controlled" onChange "new value"
 ```
 
+### AngularJS (1.x) sites
+
+AngularJS forms wrap their inputs and buttons in directives that only commit during the `$digest` cycle. A plain `pw fill`/`pw click` usually works, but breaks on forms guarded by `aria-disabled` or by validators that don't run on programmatic events. The `ng-*` commands route through Angular's own API:
+
+```bash
+pw ng-set "#email" "alex@example.com"   # → ngModelController.$setViewValue + $apply
+pw ng-click "#submitBtn"                # → angular.element(el).triggerHandler('click')
+```
+
+Both go through `$scope.$apply()`, so watchers fire and form state (`$valid`, `$touched`, etc.) updates the same way it does for a real keystroke or click.
+
 ### Talking to Safari is slow — batch when you can
 
 Each `pw` invocation pays a ~50-150 ms round-trip for `osascript`. If you're chaining several actions, `batch` runs them in one connection:

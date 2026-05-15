@@ -33,6 +33,8 @@ Usage:
     pw batch "CMD1" "CMD2" ...        Run multiple commands in one connection (faster)
     pw react-click SELECTOR           Click via React fiber (background-safe, for MUI/React)
     pw react-set SEL PROP VALUE       Set React component value via handler (e.g. onChange)
+    pw ng-click SELECTOR              Click via AngularJS triggerHandler (fires ng-click)
+    pw ng-set SELECTOR VALUE          Set ng-model value via Angular controller API
 
 Output flags (nav, click, back auto-include page text by default):
     pw nav URL                        Navigate + auto-print page text
@@ -61,6 +63,14 @@ Safari setup (one-time):
 Note: react-click and react-set find React fiber internals on DOM elements
 and invoke component handlers directly, bypassing the DOM event system.
 This works for MUI, React, and similar frameworks entirely in the background.
+
+ng-click and ng-set are the AngularJS analog. They route through
+`angular.element(el).triggerHandler('click')` and the ngModel controller's
+`$setViewValue`/`$render`, inside a `$scope.$apply()`. Use these when a
+regular `pw click` or `pw fill` is being silently ignored by a 1.x Angular
+form — typically due to validators that need a $digest pass, or buttons
+that carry `aria-disabled` (which Angular checks via its own listener
+chain that el.click() bypasses).
 
 Background mode: type/press/screenshot run fully in the background by default
 (Safari stays where it is). type/press use synthetic KeyboardEvents
@@ -152,6 +162,40 @@ REACT_FIBER_JS = (
     "    type: type || 'click',"
     "    bubbles: true, cancelable: true"
     "  };"
+    "}"
+)
+
+
+# ============================================================
+# AngularJS helper JS (used by ng-set, ng-click)
+# ============================================================
+#
+# AngularJS 1.x ties two-way binding to its own $digest cycle. Setting
+# `el.value = X` and dispatching an `input` event usually works, but
+# breaks when the form is wrapped in custom directives, when validators
+# inspect $touched/$dirty state set elsewhere, or when ng-click is bound
+# to a button that also carries aria-disabled (which Angular checks via
+# its own event listener chain — a raw `el.click()` skips that listener).
+#
+# These helpers go through Angular's own API: `angular.element(el)` for
+# the jqLite wrapper, `.controller('ngModel').$setViewValue()` for value
+# updates, `.triggerHandler('click')` for clicks. Updates run inside
+# `$scope.$apply()` so watchers fire and the digest cycle commits.
+
+ANGULAR_HELPER_JS = (
+    "function __pw_ngEl(el) {"
+    "  if (typeof angular === 'undefined' || !angular.element) return null;"
+    "  return angular.element(el);"
+    "}"
+    "function __pw_ngScope(el) {"
+    "  var $el = __pw_ngEl(el);"
+    "  if (!$el) return null;"
+    "  return $el.scope() || $el.isolateScope() || null;"
+    "}"
+    "function __pw_ngApply(scope, fn) {"
+    "  if (scope && scope.$root && scope.$root.$$phase) { fn(); return; }"
+    "  if (scope && typeof scope.$apply === 'function') { scope.$apply(fn); return; }"
+    "  fn();"
     "}"
 )
 
@@ -943,6 +987,97 @@ class SafariPage:
             raise PwError(f"Element not found (timeout {timeout}ms): {selector}")
         js = self._react_set_js(sel_js, selector, prop, value)
         return self._do_js(js, timeout=timeout // 1000 + 5)
+
+    def _ng_set_js(self, sel_js, selector, value):
+        """JS that sets an ng-model bound value via Angular's own API."""
+        escaped_value = _js_escape(value)
+        escaped_sel = _js_escape(selector)
+        return (
+            "(function(){"
+            + ANGULAR_HELPER_JS +
+            "var el = " + sel_js + ";"
+            "if (!el) throw new Error('Element not found: ' + " + escaped_sel + ");"
+            "var $el = __pw_ngEl(el);"
+            "if (!$el) throw new Error('AngularJS not detected on page');"
+            "var ctrl = $el.controller('ngModel');"
+            "if (!ctrl) throw new Error('No ng-model controller on: ' + " + escaped_sel + ");"
+            "var scope = __pw_ngScope(el);"
+            "var v = " + escaped_value + ";"
+            "__pw_ngApply(scope, function() {"
+            "  ctrl.$setViewValue(v);"
+            "  if (typeof ctrl.$render === 'function') ctrl.$render();"
+            "});"
+            "return 'set ng-model via Angular API';"
+            "})()"
+        )
+
+    def _ng_click_js(self, sel_js, selector):
+        """JS that fires ng-click via Angular's triggerHandler (runs $apply)."""
+        escaped_sel = _js_escape(selector)
+        return (
+            "(function(){"
+            + ANGULAR_HELPER_JS +
+            "var el = " + sel_js + ";"
+            "if (!el) throw new Error('Element not found: ' + " + escaped_sel + ");"
+            "var $el = __pw_ngEl(el);"
+            "if (!$el) throw new Error('AngularJS not detected on page');"
+            # triggerHandler dispatches the event through Angular's own
+            # listener chain — that is what fires ng-click. It also wraps
+            # the call in $apply automatically, so $scope changes propagate.
+            "$el.triggerHandler('click');"
+            "return 'clicked via Angular triggerHandler';"
+            "})()"
+        )
+
+    def ng_set(self, selector, value, timeout=5000):
+        """Set an ng-model bound value via Angular's own controller API."""
+        sel_js = _translate_selector(selector)
+        if not self._auto_wait(sel_js, timeout):
+            raise PwError(f"Element not found (timeout {timeout}ms): {selector}")
+        js = self._ng_set_js(sel_js, selector, value)
+        return self._do_js(js, timeout=timeout // 1000 + 5)
+
+    def ng_click(self, selector, timeout=5000):
+        """Click an element by firing its ng-click via Angular triggerHandler."""
+        sel_js = _translate_selector(selector)
+        if not self._auto_wait(sel_js, timeout):
+            raise PwError(f"Element not found (timeout {timeout}ms): {selector}")
+        js_code = json.dumps(self._ng_click_js(sel_js, selector))
+        script = f"""
+        var safari = Application("Safari");
+        {self._find_tab_jxa()}
+        var tab = __pw_tab;
+        var urlBefore = tab.url();
+        var result = safari.doJavaScript({js_code}, {{in: tab}});
+        var deadline = Date.now() + {timeout};
+        delay(0.05);
+        while (Date.now() < deadline) {{
+            try {{
+                var u = tab.url();
+                if (u !== urlBefore) {{
+                    delay(0.2);
+                    try {{ safari.doJavaScript("document.readyState", {{in: tab}}); }} catch(e2) {{}}
+                    break;
+                }}
+                break;
+            }} catch(e) {{ delay(0.2); }}
+        }}
+        JSON.stringify({{title: tab.name(), url: tab.url(), method: result}});
+        """
+        self._last_nav = {}
+        try:
+            raw = _jxa(script, timeout=timeout // 1000 + 5)
+            info = json.loads(raw) if raw else {}
+            self._last_nav = info
+            return info.get("method", "clicked")
+        except PwError as e:
+            err = str(e)
+            if "Element not found" in err or "AngularJS not detected" in err:
+                raise
+            if "timed out" in err.lower():
+                self._last_nav = {}
+                return "clicked (timed out waiting for nav)"
+            raise
 
     def wait_for_load_state(self, state=None, timeout=5000):
         # click() already waits for navigation and caches title/url.
@@ -2096,6 +2231,28 @@ def cmd_react_set(selector, prop, value):
 
     connect_and_run(do)
 
+
+def cmd_ng_click(selector, output_flag="text", output_selector=None):
+    """Click an element via AngularJS's triggerHandler (fires ng-click)."""
+    def do(browser, ctx, page):
+        method = page.ng_click(selector, timeout=5000)
+        print(f"Ng-clicked: {selector} [{method}]\nPage: {page.title()} | {page.url}")
+        _handle_output_flag(page, output_flag, output_selector)
+
+    connect_and_run(do)
+
+
+def cmd_ng_set(selector, value):
+    """Set an ng-model bound value via AngularJS controller API."""
+    def do(browser, ctx, page):
+        result = page.ng_set(selector, value, timeout=5000)
+        print(f"Ng-set: {selector}={value}")
+        if result:
+            print(f"  Result: {result}")
+
+    connect_and_run(do)
+
+
 def cmd_search(selector, text):
     def do(browser, ctx, page):
         result = page.fill_search(selector, text, timeout=10000)
@@ -2319,6 +2476,23 @@ def _react_set_handler(args):
         raise PwError("Usage: pw react-set SELECTOR PROP VALUE")
     cmd_react_set(args[0], args[1], args[2])
 
+
+def _ng_click_handler(args):
+    clean, flag, flag_sel = _parse_output_flags(args)
+    if not clean:
+        raise PwError("Usage: pw ng-click SELECTOR [--text|--links|--html [SEL]]")
+    output = flag if flag is not None else "text"
+    if output is False:
+        output = None
+    cmd_ng_click(clean[0], output_flag=output, output_selector=flag_sel)
+
+
+def _ng_set_handler(args):
+    if len(args) < 2:
+        raise PwError("Usage: pw ng-set SELECTOR VALUE")
+    cmd_ng_set(args[0], args[1])
+
+
 def _back_handler(args):
     clean, flag, flag_sel = _parse_output_flags(args)
     output = flag if flag is not None else "text"
@@ -2414,6 +2588,22 @@ def _execute_batch_step(page, cmd, args):
         print(f"React-set: {args[0]} {args[1]}={args[2]}")
         if result:
             print(f"  Result: {result}")
+    elif cmd == "ng-click":
+        clean, flag, flag_sel = _parse_output_flags(args)
+        if not clean:
+            raise PwError("ng-click requires a SELECTOR")
+        method = page.ng_click(clean[0], timeout=5000)
+        output = flag if flag is not None else None
+        print(f"Ng-clicked: {clean[0]} [{method}]")
+        if output:
+            _handle_output_flag(page, output, flag_sel)
+    elif cmd == "ng-set":
+        if len(args) < 2:
+            raise PwError("ng-set requires SELECTOR VALUE")
+        result = page.ng_set(args[0], args[1], timeout=5000)
+        print(f"Ng-set: {args[0]}={args[1]}")
+        if result:
+            print(f"  Result: {result}")
     elif cmd == "fill":
         page.fill(args[0], args[1], timeout=5000)
         print(f"Filled '{args[0]}' with '{args[1]}'")
@@ -2492,6 +2682,8 @@ COMMANDS = {
     "click":        {"handler": _click_handler,                          "min_args": 1, "usage": "pw click SELECTOR [--text|--links|--html [SEL]]"},
     "react-click":  {"handler": _react_click_handler,                    "min_args": 1, "usage": "pw react-click SELECTOR [--text|--links|--html [SEL]]"},
     "react-set":    {"handler": _react_set_handler,                      "min_args": 3, "usage": "pw react-set SELECTOR PROP VALUE"},
+    "ng-click":     {"handler": _ng_click_handler,                       "min_args": 1, "usage": "pw ng-click SELECTOR [--text|--links|--html [SEL]]"},
+    "ng-set":       {"handler": _ng_set_handler,                         "min_args": 2, "usage": "pw ng-set SELECTOR VALUE"},
     "search":     {"handler": lambda args: cmd_search(args[0], " ".join(args[1:])), "min_args": 2, "usage": "pw search SELECTOR TEXT — click search trigger, fill modal input, press Enter"},
     "fill":       {"handler": lambda args: cmd_fill(args[0], args[1]), "min_args": 2, "usage": "pw fill SELECTOR TEXT"},
     "type":       {"handler": lambda args: cmd_type(" ".join(args)),   "min_args": 1, "usage": "pw type TEXT"},

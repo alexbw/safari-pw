@@ -1656,26 +1656,27 @@ def _new_session_id():
     return f"pw_{os.getpid()}_{int(time.time() * 1000) % 1000000}_{_session_counter}"
 
 
-def _hide_pw_window(window_id):
-    """Send a Safari window to the Dock (miniaturized=true) so it's not
-    visible on any display. AppleScript only — JXA's `w.miniaturized =
-    true` silently fails on the current macOS Safari, but the equivalent
-    `tell application "Safari" to set miniaturized of window id N to true`
-    works and is honored across navigations.
+def _bury_pw_window(window_id):
+    """Push a Safari window to the back of Safari's window z-order so
+    the user's frontmost Safari window stays on top. Uses AppleScript
+    only — JXA's `w.index = N` silently fails on the current Safari but
+    `tell application "Safari" to set index of window to N` works and
+    persists across navigations.
 
-    Minimized Safari windows still respond to `do JavaScript ... in tab`,
-    and `screencapture -l<id>` reads their backing buffer cleanly, so
-    the entire pw command surface keeps working. Set PW_VISIBLE=1 to
-    skip this — useful for debugging what pw is actually doing.
+    The window is not minimized (no Dock clutter) and is full-size so
+    page rendering and screencapture work. It's just occluded behind
+    the user's Safari window. When the user is in another app, Safari
+    isn't on screen at all and the pw window is invisible by default.
+
+    Set PW_VISIBLE=1 to bring the window forward (index=1) for debugging.
     """
     if not window_id:
         return
-    # PW_VISIBLE=1 is the debug escape hatch: un-minimize the pw window
-    # if a previous run hid it. Without this flag, hide it.
-    target = "false" if os.environ.get("PW_VISIBLE") == "1" else "true"
+    # PW_VISIBLE=1 brings it forward. Default: bury.
+    target_index = "1" if os.environ.get("PW_VISIBLE") == "1" else "999"
     script = (
         f'tell application "Safari" to '
-        f'try\nset miniaturized of (every window whose id is {int(window_id)}) to {target}\n'
+        f'try\nset index of (every window whose id is {int(window_id)}) to {target_index}\n'
         f'end try'
     )
     try:
@@ -1687,26 +1688,119 @@ def _hide_pw_window(window_id):
         pass
 
 
+def _close_pw_window(window_id):
+    """Destroy a pw Safari window. Uses AppleScript `close window` because
+    JXA's `safari.windows[i].close()` doesn't reliably close windows that
+    still hold their default favorites:// tab. AppleScript's close does."""
+    if not window_id:
+        return
+    script = (
+        f'tell application "Safari" to '
+        f'try\nclose (every window whose id is {int(window_id)})\n'
+        f'end try'
+    )
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    # Drop from registry too — the id is dead.
+    ids = _read_window_registry()
+    ids.discard(int(window_id))
+    _write_window_registry(ids)
+
+
+def _sweep_orphan_pw_windows(spare_window_id=None):
+    """Boot-time sweep: for every window id in the pw registry, check if
+    the window still exists and if so whether it's an orphan (only blank
+    tabs / pw placeholder data: URLs). Orphans get closed.
+
+    A "spare" window id is excluded — the resolver passes the window
+    it's about to use, so we don't kill our own working window in
+    the same invocation that created it.
+    """
+    ids = _read_window_registry()
+    if not ids:
+        return
+    targets = [wid for wid in ids if wid != spare_window_id]
+    if not targets:
+        return
+    ids_js = json.dumps(targets)
+    # Returns the subset of ids that are alive AND look orphan-like.
+    # Orphan = every tab is favorites://, about:blank, "", or a pw
+    # marker data: URL. A tab pointing to a real http(s) URL means
+    # someone is using the window, leave it alone.
+    scan = f'''
+    var safari = Application("Safari");
+    var targets = {ids_js};
+    var targetSet = {{}};
+    for (var i = 0; i < targets.length; i++) {{ targetSet[targets[i]] = true; }}
+    var dead = [];
+    var orphan = [];
+    for (var k = 0; k < targets.length; k++) {{
+        var found = false;
+        for (var w = 0; w < safari.windows.length; w++) {{
+            try {{
+                if (safari.windows[w].id() === targets[k]) {{
+                    found = true;
+                    var win = safari.windows[w];
+                    var allBlank = true;
+                    for (var t = 0; t < win.tabs.length; t++) {{
+                        try {{
+                            var u = win.tabs[t].url() || "";
+                            var isBlank = (
+                                u === "favorites://" ||
+                                u === "about:blank" ||
+                                u === "" ||
+                                u.indexOf("data:text/html") === 0
+                            );
+                            if (!isBlank) {{ allBlank = false; break; }}
+                        }} catch(e) {{ allBlank = false; break; }}
+                    }}
+                    if (allBlank) orphan.push(targets[k]);
+                    break;
+                }}
+            }} catch(e) {{}}
+        }}
+        if (!found) dead.push(targets[k]);
+    }}
+    JSON.stringify({{dead: dead, orphan: orphan}});
+    '''
+    try:
+        raw = _jxa(scan, timeout=10)
+        result = json.loads(raw) if raw else {}
+    except (PwError, json.JSONDecodeError):
+        return
+    dead = result.get("dead", [])
+    orphans = result.get("orphan", [])
+    # Close orphan windows. Dead ids just get pruned from the registry.
+    for wid in orphans:
+        _close_pw_window(wid)  # also prunes registry
+    if dead:
+        ids = _read_window_registry()
+        for wid in dead:
+            ids.discard(int(wid))
+        _write_window_registry(ids)
+
+
 def _safari_create_new_tab(session_id=None, existing_window_id=None):
-    """Create a new tab in pw's dedicated, hidden Safari window.
+    """Find or create this session's dedicated Safari window, push a tab
+    into it, navigate to the session-marker data: URL, and return its
+    coordinates.
 
-    pw owns its own Safari window(s); user tabs live in their own. The
-    pw window is sent to the Dock (miniaturized) immediately after
-    creation so it's invisible — operations on it (JS eval, screenshot,
-    navigation) all work on a backgrounded window.
-
-    Window resolution order:
-      1. If `existing_window_id` is provided and that window still
-         exists, reuse it.
-      2. Otherwise scan for ANY window already containing a __pw_managed
-         tab and reuse that — pw sessions share one hidden window.
-      3. Otherwise create a brand-new Safari window, minimize it
-         immediately so the user never sees it.
+    Each pw session owns exactly one Safari window — no sharing across
+    sessions, no in-page-marker-based reuse, no chance of grabbing the
+    user's window by accident. When the session's window is gone (Safari
+    quit, user closed it, never existed), we make a new one. On every
+    creation the window is buried via `set index = 999` (back of Safari's
+    z-order), so when the user is in Safari they see THEIR window;
+    pw's window is occluded behind it.
 
     Returns (window_index, tab_index, session_id, window_id). The data:
-    URL the tab is navigated to bakes in the session marker so the
-    resolver can find it on subsequent commands without waiting for
-    nav() to inject anything.
+    URL bakes in the session marker so the resolver can find this tab
+    on the next command without waiting for nav() to re-inject.
     """
     sid = session_id or _new_session_id()
     blank_html = (
@@ -1716,44 +1810,31 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
     )
     data_url = "data:text/html;charset=utf-8," + urllib.parse.quote(blank_html)
     url_js = json.dumps(data_url)
-    win_id_hint = json.dumps(existing_window_id) if existing_window_id else "null"
-    # Build the candidate set of windows pw is allowed to touch: the
-    # hint (this session's last window) plus every id in the pw-owned
-    # window registry. We DO NOT trust in-page __pw_managed markers as
-    # a window-ownership signal — those can survive on a user's window
-    # if a prior pw run navigated their tab and the user never reset it.
-    candidates = set()
-    if existing_window_id:
-        candidates.add(int(existing_window_id))
-    candidates |= _read_window_registry()
-    candidate_ids_js = json.dumps(sorted(candidates))
+    # ONLY the hint id is a reuse candidate. The window registry exists
+    # for orphan cleanup, not for cross-session reuse — cross-session
+    # reuse was the bug that minimized the user's window in testing,
+    # because a stale __pw_managed marker on a tab in their window
+    # made pw "recognize" their window as a candidate.
+    hint_js = json.dumps(int(existing_window_id)) if existing_window_id else "null"
 
     # Phase 1: find or create the pw window, capture its id.
-    # Split window creation from tab creation so we can minimize the
-    # window via AppleScript BEFORE we navigate it — minimizing first
-    # means the user never sees the window even for a frame.
     locate_script = f'''
     var safari = Application("Safari");
-    var candidates = {candidate_ids_js};
-    var candidateSet = {{}};
-    for (var c = 0; c < candidates.length; c++) {{ candidateSet[candidates[c]] = true; }}
+    var hintId = {hint_js};
     var win = null;
     var created = false;
 
-    // 1. Reuse a pw-owned window we've recorded in the registry.
-    // Iterate all live windows, take the first match.
-    for (var i = 0; i < safari.windows.length; i++) {{
-        try {{
-            if (candidateSet[safari.windows[i].id()]) {{
-                win = safari.windows[i];
-                break;
-            }}
-        }} catch(e) {{}}
+    // 1. Reuse this session's recorded window if it's still alive.
+    if (hintId !== null) {{
+        for (var i = 0; i < safari.windows.length; i++) {{
+            try {{
+                if (safari.windows[i].id() === hintId) {{ win = safari.windows[i]; break; }}
+            }} catch(e) {{}}
+        }}
     }}
 
-    // 2. No registered pw window is alive — create a fresh one. We
-    // never call safari.activate(); the Python layer will minimize
-    // the new window via AppleScript next, before any navigation.
+    // 2. Otherwise create a fresh window. We never call safari.activate();
+    // the Python layer will bury it via AppleScript next.
     if (!win) {{
         var before = {{}};
         for (var b = 0; b < safari.windows.length; b++) {{
@@ -1783,16 +1864,17 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
     if not new_win_id:
         raise PwError("could not resolve pw Safari window id")
 
-    # Register this window as pw-owned and hide it. Registration must
-    # happen on every create, not just when we made a new window, to
-    # heal a corrupted/missing registry. Hiding is idempotent.
+    # Register the window as pw-owned (so the boot-time sweep can prune
+    # it later if the session never closes cleanly). Then bury it. The
+    # bury runs BEFORE we push a tab so the navigation that follows
+    # happens on a backgrounded window.
     _register_pw_window(new_win_id)
     if locate.get("created"):
-        _hide_pw_window(new_win_id)
+        _bury_pw_window(new_win_id)
 
-    # Phase 2: push a tab into the (now hidden) window, navigate to the
-    # marker data: URL, wait for readyState, and re-assert minimized
-    # state in case any side effect un-minimized the window.
+    # Phase 2: push a tab, navigate to the marker data: URL, wait for
+    # readyState. After the load we re-assert bury since Safari may
+    # surface a window when a new tab finishes loading.
     push_script = f'''
     var safari = Application("Safari");
     var targetId = {json.dumps(new_win_id)};
@@ -1830,9 +1912,8 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
     '''
     raw = _jxa(push_script)
     result = json.loads(raw) if raw else {}
-    # Re-assert minimized in case Safari surfaced the window during the
-    # push/navigate. Cheap and idempotent.
-    _hide_pw_window(new_win_id)
+    # Re-assert bury in case Safari surfaced the window during nav.
+    _bury_pw_window(new_win_id)
     return (
         result.get("window_index", 0),
         result.get("tab_index", 0),
@@ -2015,80 +2096,28 @@ def safari_launch():
 
 
 def safari_close():
-    """Clean up Safari state. With --name, close that session's tab and remove
-    only its state file. Without --name, scrub all state files (legacy behavior;
-    does not close any tab)."""
+    """Tear down this session's pw Safari window and remove its state file.
+
+    Per-session windows are not shared, so closing a session is a single
+    AppleScript `close window N` against the id recorded in state. We also
+    sweep any orphan windows still in the registry — windows from earlier
+    sessions that crashed without calling close — so they don't pile up.
+    """
     if _session_name:
         path = _safari_session_file()
-        # Close by marker, not by stored index. Indices drift as the user
-        # opens/closes tabs, so the state file's tab_index can point at an
-        # unrelated user tab by the time `close` runs. Scanning for the
-        # deterministic session marker also sweeps up any orphan placeholder
-        # tabs created by earlier failed-resolution paths.
-        deterministic_sid = f"pw_named_{_session_name}"
         state = _read_tab_state()
-        stored_sid = state.get("session_id", "") if state else ""
-        stored_url = state.get("url", "") if state else ""
-        # Match both deterministic and any legacy/random sid stored in state.
-        sid_targets = [deterministic_sid]
-        if stored_sid and stored_sid != deterministic_sid:
-            sid_targets.append(stored_sid)
-        sid_targets_js = json.dumps(sid_targets)
-        url_target_js = json.dumps(stored_url)
-        try:
-            raw = _jxa(f'''
-            var safari = Application("Safari");
-            var sidTargets = {sid_targets_js};
-            var urlTarget = {url_target_js};
-            var closed = 0;
-            for (var w = 0; w < safari.windows.length; w++) {{
-                // Iterate backwards so closing doesn't shift indices we
-                // haven't visited yet.
-                for (var t = safari.windows[w].tabs.length - 1; t >= 0; t--) {{
-                    var matchedBySid = false, matchedByUrl = false;
-                    try {{
-                        var sid = safari.doJavaScript(
-                            "window.__pw_session_id || ''",
-                            {{in: safari.windows[w].tabs[t]}}
-                        );
-                        for (var i = 0; i < sidTargets.length; i++) {{
-                            if (sid && sid === sidTargets[i]) {{
-                                matchedBySid = true;
-                                break;
-                            }}
-                        }}
-                    }} catch(e) {{}}
-                    // Also match the data: placeholder URLs that bake the
-                    // sid into HTML — they may have been created before any
-                    // marker injection ran.
-                    try {{
-                        var url = safari.windows[w].tabs[t].url();
-                        if (url && url.indexOf("data:text/html") === 0) {{
-                            for (var j = 0; j < sidTargets.length; j++) {{
-                                if (url.indexOf(sidTargets[j]) >= 0) {{
-                                    matchedByUrl = true;
-                                    break;
-                                }}
-                            }}
-                        }}
-                    }} catch(e) {{}}
-                    if (matchedBySid || matchedByUrl) {{
-                        try {{ safari.windows[w].tabs[t].close(); closed++; }}
-                        catch(e) {{}}
-                    }}
-                }}
-            }}
-            JSON.stringify({{closed: closed}});
-            ''', timeout=10)
-            result = json.loads(raw) if raw else {}
-            closed = result.get("closed", 0)
-        except (PwError, json.JSONDecodeError):
-            closed = 0
+        win_id = state.get("window_id") if state else None
+        if win_id:
+            _close_pw_window(int(win_id))
         if os.path.exists(path):
             os.unlink(path)
-        print(f"Session {_session_name!r} closed. ({closed} tab(s) removed)")
+        # Sweep any other registry-tracked orphans (windows from crashed
+        # sessions whose state file is gone but window still exists).
+        _sweep_orphan_pw_windows()
+        print(f"Session {_session_name!r} closed.")
         return
 
+    # Unnamed: scrub all state files AND close any orphan pw windows.
     import glob as _glob
     paths = [SAFARI_TAB_FILE]
     paths += _glob.glob(os.path.join(STATE_DIR, "session-*.json"))
@@ -2102,6 +2131,9 @@ def safari_close():
                 os.unlink(path)
         except OSError:
             pass
+    # Close every window we know about. This is a full reset.
+    for wid in list(_read_window_registry()):
+        _close_pw_window(wid)
     print("Safari state cleaned. (Safari left running)")
 
 
@@ -2135,6 +2167,18 @@ def _safari_connect_and_run(fn):
     win_idx, tab_idx, session_id = _resolve_safari_tab(create_if_missing=True)
     page = SafariPage(tab_idx, session_id=session_id or None, window_idx=win_idx)
     ctx = _SafariCtx(window_idx=win_idx)
+
+    # Opportunistically prune orphan pw windows from previous crashed
+    # sessions. Excludes the window we just resolved so we don't kill
+    # ourselves. Cheap (only touches registered ids) and idempotent.
+    state_now = _read_tab_state()
+    my_win_id = state_now.get("window_id") if state_now else None
+    _sweep_orphan_pw_windows(spare_window_id=my_win_id)
+    # Re-assert bury — if Safari surfaced our window during the resolve
+    # path (e.g., new tab finished loading), push it back behind the
+    # user's frontmost Safari window again.
+    if my_win_id:
+        _bury_pw_window(int(my_win_id))
 
     try:
         return fn(None, ctx, page)

@@ -79,8 +79,10 @@ PW_KEYSTROKE=1 to force OS-level keystrokes via System Events; that path
 activates Safari and requires Accessibility permission.
 """
 
+import fcntl
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -98,7 +100,7 @@ STATE_DIR = os.path.join(
 )
 SAFARI_TAB_FILE = os.path.join(STATE_DIR, "default.json")
 # Registry of Safari window ids that pw has created and owns. Used to
-# distinguish "windows pw can safely minimize / push tabs into" from
+# distinguish "windows pw can safely bury / push tabs into" from
 # windows that just happen to contain an orphan __pw_managed marker (e.g.
 # a user's Safari window where a buggy older pw left a marker before the
 # user navigated it away). We only reuse / hide windows whose id is in
@@ -301,6 +303,36 @@ def _jxa(script, timeout=30):
             raise PwError("Safari is not running. Use: pw launch")
         raise PwError(f"JXA error: {stderr}")
     return result.stdout.strip()
+
+
+def _osascript(script, timeout=5):
+    """Best-effort AppleScript execution via osascript -e. Used by the
+    window-management helpers (bury, close) where any failure mode is
+    handled by the next pw command's boot-time sweep — there's nothing
+    actionable to raise to the caller."""
+    try:
+        return subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _safe_json_write(path, obj):
+    """Locked-down JSON write at `path` with mode 0600 and O_NOFOLLOW so
+    a pre-created symlink at the path can't redirect the write. No-ops
+    silently on OSError (e.g., refusing to follow a symlink)."""
+    _ensure_state_dir()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        return
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
 
 
 def _js_escape(s):
@@ -1572,22 +1604,8 @@ def _read_tab_state():
 
 
 def _write_tab_state(state):
-    """Write tab state to the session file with mode 0600 in the per-user
-    state dir. Open with O_NOFOLLOW so a pre-created symlink at the path
-    can't redirect the write to another file."""
-    _ensure_state_dir()
-    path = _safari_session_file()
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(path, flags, 0o600)
-    except OSError:
-        # If something already exists at the path that we can't open safely
-        # (e.g. a symlink), refuse rather than follow it.
-        return
-    with os.fdopen(fd, "w") as f:
-        json.dump(state, f)
+    """Persist tab state for the current session."""
+    _safe_json_write(_safari_session_file(), state)
 
 
 def _safari_tab_index():
@@ -1597,8 +1615,6 @@ def _safari_tab_index():
         return 0
     return state.get("tab_index", 0)
 
-
-import fcntl as _fcntl  # for advisory lock on the registry RMW
 
 # Sweep grace period: a registry entry younger than this is considered
 # "still being set up" and won't be closed by the orphan sweep even if
@@ -1645,20 +1661,12 @@ def _read_window_registry():
 
 
 def _write_window_registry(entries):
-    """Persist the registry. `entries` is a dict {window_id: ts}. Same
-    locked-down write semantics as tab state (0600, O_NOFOLLOW)."""
-    _ensure_state_dir()
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(PW_WINDOW_REGISTRY, flags, 0o600)
-    except OSError:
-        return
+    """Persist the registry. `entries` is a dict {window_id: ts}."""
     # JSON object keys must be strings.
-    serialized = {str(k): float(v) for k, v in entries.items()}
-    with os.fdopen(fd, "w") as f:
-        json.dump(serialized, f)
+    _safe_json_write(
+        PW_WINDOW_REGISTRY,
+        {str(k): float(v) for k, v in entries.items()},
+    )
 
 
 def _registry_rmw(mutator):
@@ -1683,7 +1691,7 @@ def _registry_rmw(mutator):
         return
     try:
         try:
-            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
         except OSError:
             pass
         entries = _read_window_registry()
@@ -1693,7 +1701,7 @@ def _registry_rmw(mutator):
         _write_window_registry(entries)
     finally:
         try:
-            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
         except OSError:
             pass
         os.close(lock_fd)
@@ -1710,11 +1718,6 @@ def _register_pw_window(window_id):
     def _add(entries):
         entries[wid] = now
     _registry_rmw(_add)
-
-
-def _registered_ids():
-    """Convenience for callers that only need the id set."""
-    return set(_read_window_registry().keys())
 
 
 def _new_session_id():
@@ -1735,57 +1738,41 @@ def _new_session_id():
     return f"pw_{os.getpid()}_{int(time.time() * 1000) % 1000000}_{_session_counter}"
 
 
+# Z-order target for the pw window. 999 = behind every other Safari window;
+# 1 = frontmost-in-Safari (debug mode, set PW_VISIBLE=1).
+_PW_BURY_INDEX = 999
+
+
 def _bury_pw_window(window_id):
-    """Push a Safari window to the back of Safari's window z-order so
-    the user's frontmost Safari window stays on top. Uses AppleScript
-    only — JXA's `w.index = N` silently fails on the current Safari but
-    `tell application "Safari" to set index of window to N` works and
-    persists across navigations.
+    """Push a Safari window to the back of Safari's window z-order so the
+    user's frontmost Safari window stays on top. JXA's `w.index = N`
+    silently fails on current Safari; the AppleScript equivalent works
+    and persists across navigations.
 
     The window is not minimized (no Dock clutter) and is full-size so
     page rendering and screencapture work. It's just occluded behind
-    the user's Safari window. When the user is in another app, Safari
-    isn't on screen at all and the pw window is invisible by default.
-
-    Set PW_VISIBLE=1 to bring the window forward (index=1) for debugging.
+    the user's Safari window. PW_VISIBLE=1 brings it forward instead.
     """
     if not window_id:
         return
-    # PW_VISIBLE=1 brings it forward. Default: bury.
-    target_index = "1" if os.environ.get("PW_VISIBLE") == "1" else "999"
-    script = (
+    target = 1 if os.environ.get("PW_VISIBLE") == "1" else _PW_BURY_INDEX
+    _osascript(
         f'tell application "Safari" to '
-        f'try\nset index of (every window whose id is {int(window_id)}) to {target_index}\n'
-        f'end try'
+        f'set index of (every window whose id is {int(window_id)}) to {target}'
     )
-    try:
-        subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, timeout=5,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        pass
 
 
 def _close_pw_window(window_id):
-    """Destroy a pw Safari window. Uses AppleScript `close window` because
-    JXA's `safari.windows[i].close()` doesn't reliably close windows that
-    still hold their default favorites:// tab. AppleScript's close does."""
+    """Destroy a pw Safari window. AppleScript `close` actually closes;
+    JXA's `safari.windows[i].close()` leaves the window stranded with a
+    default favorites:// tab. (Safari still keeps a zero-tab phantom in
+    `safari.windows[]` afterwards — the sweep handles those.)"""
     if not window_id:
         return
-    script = (
+    _osascript(
         f'tell application "Safari" to '
-        f'try\nclose (every window whose id is {int(window_id)})\n'
-        f'end try'
+        f'close (every window whose id is {int(window_id)})'
     )
-    try:
-        subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, timeout=5,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    # Drop from registry too — the id is dead.
     wid_int = int(window_id)
     def _drop(entries):
         entries.pop(wid_int, None)
@@ -1909,11 +1896,11 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
     )
     data_url = "data:text/html;charset=utf-8," + urllib.parse.quote(blank_html)
     url_js = json.dumps(data_url)
-    # ONLY the hint id is a reuse candidate. The window registry exists
-    # for orphan cleanup, not for cross-session reuse — cross-session
-    # reuse was the bug that minimized the user's window in testing,
-    # because a stale __pw_managed marker on a tab in their window
-    # made pw "recognize" their window as a candidate.
+    # Only the hint id is a reuse candidate. The registry exists for
+    # orphan cleanup, not for cross-session lookup — trusting in-page
+    # markers as a window-ownership signal is unsafe because the user
+    # can navigate any tab away from a pw URL, leaving a stale marker
+    # on a tab in their own window.
     hint_js = json.dumps(int(existing_window_id)) if existing_window_id else "null"
 
     # Phase 1: find or create the pw window, capture its id.
@@ -1940,12 +1927,17 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
             try {{ before[safari.windows[b].id()] = true; }} catch(e) {{}}
         }}
         safari.Document().make();
-        delay(0.15);
-        for (var k = 0; k < safari.windows.length; k++) {{
-            try {{
-                var kid = safari.windows[k].id();
-                if (!before[kid]) {{ win = safari.windows[k]; created = true; break; }}
-            }} catch(e) {{}}
+        // Poll until the new window id appears (typically 20-50ms),
+        // with a 500ms cap so we don't hang on a Safari hiccup.
+        var locDeadline = Date.now() + 500;
+        while (Date.now() < locDeadline && !win) {{
+            for (var k = 0; k < safari.windows.length; k++) {{
+                try {{
+                    var kid = safari.windows[k].id();
+                    if (!before[kid]) {{ win = safari.windows[k]; created = true; break; }}
+                }} catch(e) {{}}
+            }}
+            if (!win) delay(0.02);
         }}
     }}
 
@@ -2000,18 +1992,6 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
         delay(0.05);
     }}
 
-    // Bury IMMEDIATELY here, before returning to Python, so Safari's
-    // "load complete" surfacing (if any) can't outrun the next osascript
-    // round-trip. Shell out to AppleScript — JXA's index setter silently
-    // fails on current Safari. Single-line AppleScript avoids the
-    // newline-escaping minefield.
-    try {{
-        var _app = Application.currentApplication();
-        _app.includeStandardAdditions = true;
-        var burySrc = 'tell application "Safari" to set index of (every window whose id is ' + targetId + ') to 999';
-        _app.doShellScript("osascript -e " + JSON.stringify(burySrc));
-    }} catch(e) {{}}
-
     // Re-resolve winIdx in case window order shifted while we waited.
     for (var m = 0; m < safari.windows.length; m++) {{
         try {{
@@ -2023,8 +2003,11 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
     '''
     raw = _jxa(push_script)
     result = json.loads(raw) if raw else {}
-    # Re-assert bury in case Safari surfaced the window during nav.
-    _bury_pw_window(new_win_id)
+    # Only re-bury when we created the window — a reused buried window
+    # stays buried across a tab push (verified via System Events frontmost
+    # poll). The first-create bury already happened above.
+    if locate.get("created"):
+        _bury_pw_window(new_win_id)
     return (
         result.get("window_index", 0),
         result.get("tab_index", 0),
@@ -2279,17 +2262,17 @@ def _safari_connect_and_run(fn):
     page = SafariPage(tab_idx, session_id=session_id or None, window_idx=win_idx)
     ctx = _SafariCtx(window_idx=win_idx)
 
-    # Opportunistically prune orphan pw windows from previous crashed
-    # sessions. Excludes the window we just resolved so we don't kill
-    # ourselves. Cheap (only touches registered ids) and idempotent.
+    # Probabilistic orphan sweep. Orphans only come from a session that
+    # crashed without calling `pw close`, so they don't need bench-instant
+    # cleanup — a ~1/10 firing rate amortizes the JXA scan cost across
+    # commands while still pruning within seconds under any real workload.
     state_now = _read_tab_state()
     my_win_id = state_now.get("window_id") if state_now else None
-    _sweep_orphan_pw_windows(spare_window_id=my_win_id)
-    # Re-assert bury — if Safari surfaced our window during the resolve
-    # path (e.g., new tab finished loading), push it back behind the
-    # user's frontmost Safari window again.
-    if my_win_id:
-        _bury_pw_window(int(my_win_id))
+    if random.random() < 0.1:
+        _sweep_orphan_pw_windows(spare_window_id=my_win_id)
+    # The resolver buries on create. Reused windows stay buried across
+    # subsequent commands (Safari doesn't auto-promote on doJavaScript or
+    # url-set), so no re-bury here.
 
     try:
         return fn(None, ctx, page)

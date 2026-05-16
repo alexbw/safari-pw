@@ -1598,25 +1598,55 @@ def _safari_tab_index():
     return state.get("tab_index", 0)
 
 
+import fcntl as _fcntl  # for advisory lock on the registry RMW
+
+# Sweep grace period: a registry entry younger than this is considered
+# "still being set up" and won't be closed by the orphan sweep even if
+# its tabs look like placeholders. Window creation + first nav is
+# typically <2s; 60s leaves plenty of headroom for slow sites.
+PW_SWEEP_GRACE_SECONDS = 60
+
+
+def _registry_lock_path():
+    return PW_WINDOW_REGISTRY + ".lock"
+
+
 def _read_window_registry():
-    """Return the set of Safari window ids that pw has created. Pruned
-    against the live window list by callers — this just decodes the
-    on-disk record."""
+    """Return {window_id: registered_at_unix_ts} for every pw-owned
+    window. Tolerates the legacy list-of-ids format (no timestamp →
+    treated as registered "now" so they age in normally).
+    """
     if not os.path.exists(PW_WINDOW_REGISTRY):
-        return set()
+        return {}
     try:
         with open(PW_WINDOW_REGISTRY) as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return set()
-    if not isinstance(data, list):
-        return set()
-    return {int(x) for x in data if isinstance(x, int) and not isinstance(x, bool) and x > 0}
+        return {}
+    now = time.time()
+    out = {}
+    if isinstance(data, list):
+        # Legacy format: [id, id, ...] — no timestamp. Pretend they
+        # were just registered so the grace period applies; better
+        # safe than aggressive on upgrade.
+        for x in data:
+            if isinstance(x, int) and not isinstance(x, bool) and x > 0:
+                out[int(x)] = now
+    elif isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                wid = int(k)
+                ts = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else now
+                if wid > 0:
+                    out[wid] = ts
+            except (ValueError, TypeError):
+                continue
+    return out
 
 
-def _write_window_registry(ids):
-    """Persist the set of pw-owned window ids. Same locked-down write
-    semantics as the tab state file (0600, O_NOFOLLOW)."""
+def _write_window_registry(entries):
+    """Persist the registry. `entries` is a dict {window_id: ts}. Same
+    locked-down write semantics as tab state (0600, O_NOFOLLOW)."""
     _ensure_state_dir()
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
@@ -1625,17 +1655,66 @@ def _write_window_registry(ids):
         fd = os.open(PW_WINDOW_REGISTRY, flags, 0o600)
     except OSError:
         return
+    # JSON object keys must be strings.
+    serialized = {str(k): float(v) for k, v in entries.items()}
     with os.fdopen(fd, "w") as f:
-        json.dump(sorted(ids), f)
+        json.dump(serialized, f)
+
+
+def _registry_rmw(mutator):
+    """Read-modify-write the registry under an advisory file lock so
+    concurrent pw processes don't lose each other's entries. `mutator`
+    takes the dict and mutates it in place (or returns a new dict)."""
+    _ensure_state_dir()
+    lock_path = _registry_lock_path()
+    # Open the lock file separately from the registry file so the lock
+    # survives O_TRUNC on the registry itself.
+    try:
+        lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError:
+        # If we can't get a lock, fall back to lock-free RMW. Worst case
+        # is registry leakage (a window id gets lost), which is
+        # recoverable via boot-time sweep on next run.
+        entries = _read_window_registry()
+        result = mutator(entries)
+        if result is not None:
+            entries = result
+        _write_window_registry(entries)
+        return
+    try:
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+        except OSError:
+            pass
+        entries = _read_window_registry()
+        result = mutator(entries)
+        if result is not None:
+            entries = result
+        _write_window_registry(entries)
+    finally:
+        try:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
 
 
 def _register_pw_window(window_id):
-    """Add a window id to the pw-owned registry."""
+    """Add a window id to the pw-owned registry with a current
+    timestamp. Held under advisory lock so concurrent pw processes
+    don't lose entries via O_TRUNC."""
     if not window_id:
         return
-    ids = _read_window_registry()
-    ids.add(int(window_id))
-    _write_window_registry(ids)
+    wid = int(window_id)
+    now = time.time()
+    def _add(entries):
+        entries[wid] = now
+    _registry_rmw(_add)
+
+
+def _registered_ids():
+    """Convenience for callers that only need the id set."""
+    return set(_read_window_registry().keys())
 
 
 def _new_session_id():
@@ -1707,24 +1786,35 @@ def _close_pw_window(window_id):
     except (subprocess.TimeoutExpired, OSError):
         pass
     # Drop from registry too — the id is dead.
-    ids = _read_window_registry()
-    ids.discard(int(window_id))
-    _write_window_registry(ids)
+    wid_int = int(window_id)
+    def _drop(entries):
+        entries.pop(wid_int, None)
+    _registry_rmw(_drop)
 
 
 def _sweep_orphan_pw_windows(spare_window_id=None):
-    """Boot-time sweep: for every window id in the pw registry, check if
-    the window still exists and if so whether it's an orphan (only blank
-    tabs / pw placeholder data: URLs). Orphans get closed.
+    """Boot-time sweep: for every window id in the pw registry that's
+    OLDER than the grace period, check if the window still exists and
+    whether it's an orphan (only blank / pw placeholder tabs). Orphans
+    get closed; ids whose window has disappeared get pruned.
 
-    A "spare" window id is excluded — the resolver passes the window
-    it's about to use, so we don't kill our own working window in
-    the same invocation that created it.
+    The grace period (PW_SWEEP_GRACE_SECONDS) protects in-flight
+    creates: a concurrent pw process may have just registered a window
+    but not yet pushed its real tab, and we don't want this process to
+    kill it for "looking orphan-like" in that small interval.
+
+    `spare_window_id` is excluded unconditionally — typically the
+    caller's own working window.
     """
-    ids = _read_window_registry()
-    if not ids:
+    entries = _read_window_registry()
+    if not entries:
         return
-    targets = [wid for wid in ids if wid != spare_window_id]
+    now = time.time()
+    grace = PW_SWEEP_GRACE_SECONDS
+    targets = [
+        wid for wid, ts in entries.items()
+        if wid != spare_window_id and (now - ts) >= grace
+    ]
     if not targets:
         return
     ids_js = json.dumps(targets)
@@ -1732,11 +1822,14 @@ def _sweep_orphan_pw_windows(spare_window_id=None):
     # Orphan = every tab is favorites://, about:blank, "", or a pw
     # marker data: URL. A tab pointing to a real http(s) URL means
     # someone is using the window, leave it alone.
+    #
+    # A window with ZERO tabs is treated as already-dead (phantom from
+    # a prior close — AppleScript `close` can't fully destroy a Safari
+    # window). Those get pruned from the registry but we don't try to
+    # close them again.
     scan = f'''
     var safari = Application("Safari");
     var targets = {ids_js};
-    var targetSet = {{}};
-    for (var i = 0; i < targets.length; i++) {{ targetSet[targets[i]] = true; }}
     var dead = [];
     var orphan = [];
     for (var k = 0; k < targets.length; k++) {{
@@ -1746,6 +1839,11 @@ def _sweep_orphan_pw_windows(spare_window_id=None):
                 if (safari.windows[w].id() === targets[k]) {{
                     found = true;
                     var win = safari.windows[w];
+                    if (win.tabs.length === 0) {{
+                        // Phantom — already effectively closed.
+                        dead.push(targets[k]);
+                        break;
+                    }}
                     var allBlank = true;
                     for (var t = 0; t < win.tabs.length; t++) {{
                         try {{
@@ -1779,10 +1877,11 @@ def _sweep_orphan_pw_windows(spare_window_id=None):
     for wid in orphans:
         _close_pw_window(wid)  # also prunes registry
     if dead:
-        ids = _read_window_registry()
-        for wid in dead:
-            ids.discard(int(wid))
-        _write_window_registry(ids)
+        dead_ints = {int(x) for x in dead}
+        def _prune(entries):
+            for w in dead_ints:
+                entries.pop(w, None)
+        _registry_rmw(_prune)
 
 
 def _safari_create_new_tab(session_id=None, existing_window_id=None):
@@ -1900,6 +1999,18 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
         }} catch(e) {{}}
         delay(0.05);
     }}
+
+    // Bury IMMEDIATELY here, before returning to Python, so Safari's
+    // "load complete" surfacing (if any) can't outrun the next osascript
+    // round-trip. Shell out to AppleScript — JXA's index setter silently
+    // fails on current Safari. Single-line AppleScript avoids the
+    // newline-escaping minefield.
+    try {{
+        var _app = Application.currentApplication();
+        _app.includeStandardAdditions = true;
+        var burySrc = 'tell application "Safari" to set index of (every window whose id is ' + targetId + ') to 999';
+        _app.doShellScript("osascript -e " + JSON.stringify(burySrc));
+    }} catch(e) {{}}
 
     // Re-resolve winIdx in case window order shifted while we waited.
     for (var m = 0; m < safari.windows.length; m++) {{

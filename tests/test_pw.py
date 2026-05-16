@@ -928,7 +928,7 @@ class TestEmptyTabRegression:
         we'd already injected the marker, so a read-back returned NONE.
         Post-fix, the marker lives inside the data: URL's HTML, so it's
         present as soon as the page is loaded."""
-        win, tab, sid = pw._safari_create_new_tab()
+        win, tab, sid, win_id = pw._safari_create_new_tab()
         try:
             got = pw._jxa(
                 f'var s = Application("Safari"); '
@@ -942,11 +942,13 @@ class TestEmptyTabRegression:
                 f"fail to resolve this tab and spawn duplicates."
             )
         finally:
-            # Clean up the managed tab we just created
+            # Clean up the managed tab + its dedicated pw window.
             try:
                 pw._jxa(
                     f'var s = Application("Safari"); '
-                    f'try {{ s.windows[{win}].tabs[{tab}].close(); }} catch(e) {{}}'
+                    f'for (var i = 0; i < s.windows.length; i++) {{'
+                    f'  try {{ if (s.windows[i].id() === {win_id}) {{ s.windows[i].close(); break; }} }}'
+                    f'  catch(e) {{}} }}'
                 )
             except Exception:
                 pass
@@ -956,7 +958,7 @@ class TestEmptyTabRegression:
         verbatim (so callers don't have to mint-then-discover; the id
         baked into the tab matches the id they persist in state)."""
         my_sid = f"pw_explicit_{int(time.time())}"
-        win, tab, sid = pw._safari_create_new_tab(session_id=my_sid)
+        win, tab, sid, win_id = pw._safari_create_new_tab(session_id=my_sid)
         try:
             assert sid == my_sid, f"explicit sid not honored: passed {my_sid}, got {sid}"
             got = pw._jxa(
@@ -969,7 +971,9 @@ class TestEmptyTabRegression:
             try:
                 pw._jxa(
                     f'var s = Application("Safari"); '
-                    f'try {{ s.windows[{win}].tabs[{tab}].close(); }} catch(e) {{}}'
+                    f'for (var i = 0; i < s.windows.length; i++) {{'
+                    f'  try {{ if (s.windows[i].id() === {win_id}) {{ s.windows[i].close(); break; }} }}'
+                    f'  catch(e) {{}} }}'
                 )
             except Exception:
                 pass
@@ -1529,24 +1533,36 @@ class TestResolveTabCreateIfMissing:
         injected into the new tab so subsequent resolves match the marker."""
         monkeypatch.setattr(pw, "_session_name", "test-create")
         monkeypatch.setattr(pw, "SAFARI_TAB_FILE", str(tmp_path / "nonexistent"))
-        # Mock _safari_create_new_tab to avoid actual Safari calls
         created = []
         monkeypatch.setattr(
             pw, "_safari_create_new_tab",
-            lambda session_id=None: (created.append(1), (0, 5, "pw_mock_sid"))[1],
+            lambda session_id=None, existing_window_id=None: (
+                created.append(existing_window_id),
+                (0, 5, "pw_mock_sid", 12345),
+            )[1],
         )
         result = pw._resolve_safari_tab(create_if_missing=True)
         assert result == (0, 5, "pw_mock_sid")
         assert len(created) == 1
 
-    def test_with_state_no_session_returns_stored(self, tmp_path, monkeypatch):
-        """Without a session name, falls back to stored (window, tab) index.
-        Resolver returns 3-tuple (win, tab, session_id)."""
-        f = tmp_path / "tab"
-        f.write_text(json.dumps({"tab_index": 3, "window_index": 0}))
-        monkeypatch.setattr(pw, "SAFARI_TAB_FILE", str(f))
+    def test_no_state_no_session_still_creates_managed_tab(self, tmp_path, monkeypatch):
+        """Even without a session name, the resolver must NEVER return
+        indices pointing at the user's tab. With no state and no name,
+        it must create a managed tab in pw's own window. The old behavior
+        of returning (0, 0, "") would have targeted whatever tab the user
+        had frontmost — the exact tab-hijacking we promise to prevent."""
         monkeypatch.setattr(pw, "_session_name", None)
-        assert pw._resolve_safari_tab(create_if_missing=True) == (0, 3, "")
+        monkeypatch.setattr(pw, "SAFARI_TAB_FILE", str(tmp_path / "nonexistent"))
+        created = []
+        monkeypatch.setattr(
+            pw, "_safari_create_new_tab",
+            lambda session_id=None, existing_window_id=None: (
+                created.append(1),
+                (2, 0, "pw_auto_sid", 999),
+            )[1],
+        )
+        assert pw._resolve_safari_tab(create_if_missing=True) == (2, 0, "pw_auto_sid")
+        assert len(created) == 1, "resolver must mint a managed tab, not return (0,0,'')"
 
     def test_recovery_branches_persist_new_session_id(self):
         """REGRESSION: when the resolver creates a recovery tab (because
@@ -1885,17 +1901,17 @@ class TestCreateNewTab:
         )
         assert sig.parameters["session_id"].default is None
 
-    def test_returns_three_tuple_with_session_id(self):
-        """REGRESSION: must return (win, tab, session_id) — not just
-        (win, tab). Pre-fix, callers minted their own session_id after
-        the fact, so the id baked into the tab marker (or rather: the
-        id that *should* have been baked in) didn't match the id
-        persisted in state, which broke marker-based tab resolution."""
+    def test_returns_tuple_with_session_id_and_window_id(self):
+        """REGRESSION: must return (win, tab, session_id, window_id).
+        Pre-fix, callers minted their own session_id after the fact, so
+        the id baked into the tab marker didn't match the id persisted
+        in state. window_id was added so subsequent tab creations can
+        reuse pw's dedicated Safari window instead of spawning a fresh
+        one."""
         import inspect
         source = inspect.getsource(pw._safari_create_new_tab)
-        # Returns a 3-element tuple ending in the sid
-        assert "return (" in source and ", sid)" in source, (
-            "must return (win, tab, sid) tuple"
+        assert "sid," in source and 'result.get("window_id")' in source, (
+            "must return (win, tab, sid, window_id) tuple"
         )
 
     def test_marker_baked_into_initial_url(self):

@@ -205,6 +205,20 @@ class PwError(Exception):
     pass
 
 
+def _require_foreground_opt_in(triggered_by):
+    """Refuse to foreground Safari unless the caller explicitly opted in via
+    PW_ALLOW_FOREGROUND=1. pw runs in the background by design — the user may
+    be actively using Safari, and stealing focus disrupts their work."""
+    if os.environ.get("PW_ALLOW_FOREGROUND") == "1":
+        return
+    raise PwError(
+        f"{triggered_by} requires foregrounding Safari, which is disabled "
+        "by default to avoid disrupting your browsing. Set "
+        "PW_ALLOW_FOREGROUND=1 to allow it (only safe when no human is "
+        "using Safari)."
+    )
+
+
 def _wrap_multi_statement_js(js):
     """Wrap multi-statement JS in an IIFE so Safari JXA returns the last value.
 
@@ -330,27 +344,12 @@ def _build_tab_finder_jxa(session_id, hint_win=0, hint_tab=0):
             if (__pw_tab) break;
         }}
     }}
-    // Fallback: hinted indices if in range, else frontmost window's current
-    // tab. Never throw — callers may continue to operate on whatever tab we
-    // hand back (e.g. screenshot of the wrong-but-real Safari window beats
-    // a JXA exception, which the Python layer would convert into a
-    // full-screen capture and leak unrelated content).
+    // No managed tab found. Refuse to fall back to a stored index or to
+    // the user's frontmost tab — operating on a tab pw didn't create is
+    // exactly the hijacking we promise never to do. Throw so the Python
+    // layer can catch and create a fresh managed tab + retry.
     if (!__pw_tab) {{
-        try {{
-            if ({hint_win} < safari.windows.length) {{
-                __pw_win = safari.windows[{hint_win}];
-                if ({hint_tab} < __pw_win.tabs.length) {{
-                    __pw_tab = __pw_win.tabs[{hint_tab}];
-                }}
-            }}
-        }} catch(e) {{}}
-        if (!__pw_tab && safari.windows.length > 0) {{
-            __pw_win = safari.windows[0];
-            try {{ __pw_tab = __pw_win.currentTab(); }} catch(e) {{}}
-            if (!__pw_tab && __pw_win.tabs.length > 0) {{
-                __pw_tab = __pw_win.tabs[0];
-            }}
-        }}
+        throw new Error("__PW_TAB_GONE__: no managed pw tab for session " + {escaped_sid});
     }}
     '''
 
@@ -469,6 +468,7 @@ class _SafariKeyboard:
         self._page._do_js(js)
 
     def _type_keystroke(self, text):
+        _require_foreground_opt_in("PW_KEYSTROKE")
         escaped = _js_escape(text)
         _jxa(f'''
         var safari = Application("Safari");
@@ -547,6 +547,7 @@ class _SafariKeyboard:
         self._page._do_js(js)
 
     def _press_keystroke(self, key):
+        _require_foreground_opt_in("PW_KEYSTROKE")
         if key in MAC_KEY_CODES:
             _jxa(f'''
             var safari = Application("Safari");
@@ -651,6 +652,11 @@ class SafariPage:
     def goto(self, url, wait_until=None, timeout=30000):
         escaped_url = _js_escape(url)
         timeout_s = max(timeout // 1000, 5)
+        # Double-JSON: outer encodes the string for embedding in JXA
+        # source; inner encodes the sid value for the JS we hand to
+        # safari.doJavaScript at runtime, so the re-injected marker is a
+        # valid JS string literal.
+        sid_js_literal = json.dumps(json.dumps(self._session_id))
         script = f'''
         var safari = Application("Safari");
         {self._find_tab_jxa()}
@@ -687,6 +693,20 @@ class SafariPage:
             }}
         }}
 
+        // Re-inject the session marker. The pre-nav data: URL had it
+        // baked in, but the navigation just replaced the document. We
+        // do this INSIDE the same script while we still hold `tab` —
+        // running it via a separate _do_js would have to look up the
+        // tab again by marker, and the marker is exactly what we're
+        // trying to set (chicken-and-egg).
+        try {{
+            safari.doJavaScript(
+                "window.__pw_session_id = " + {sid_js_literal} + "; " +
+                "window.__pw_managed = true;",
+                {{in: tab}}
+            );
+        }} catch(e) {{}}
+
         // Get title from JS context (tab.name() can be stale during navigation)
         var finalTitle = "";
         try {{ finalTitle = safari.doJavaScript("document.title", {{in: tab}}); }} catch(e) {{}}
@@ -699,23 +719,17 @@ class SafariPage:
             self._last_nav = json.loads(raw) if raw else {}
         except (json.JSONDecodeError, TypeError):
             self._last_nav = {}
-        # Inject session marker and managed flag for tab tracking.
-        # _do_js wraps the JS in `return ...;` so we MUST pass a single
-        # expression — multi-statement JS only runs its first statement
-        # before the return. Use a comma expression to set both fields.
-        try:
-            self._do_js(
-                f'(window.__pw_session_id = {_js_escape(self._session_id)}, '
-                f'window.__pw_managed = true, true)'
-            )
-        except PwError:
-            pass
-        # Persist tab state
+        # Persist tab state. Preserve any window_id recorded by the
+        # resolver/creator so subsequent tab creations reuse pw's own
+        # Safari window instead of spawning a fresh one.
+        prior = _read_tab_state() or {}
+        prior_wid = prior.get("window_id") if isinstance(prior, dict) else None
         _write_tab_state({
             "session_id": self._session_id,
             "url": self._last_nav.get("url", ""),
             "tab_index": self._tab,
             "window_index": self._win,
+            "window_id": prior_wid,
         })
 
     def title(self):
@@ -1336,17 +1350,18 @@ class SafariPage:
                 f"screenshot capture failed for Safari window {win_id} "
                 f"(no file written to {path})"
             )
-        # Restore user's original tab (use finder to get the right window).
-        # If this fails we tell the user — silent failure here would leave
-        # them looking at the pw tab without explanation.
+        # Restore the previously-current tab inside pw's own window. Since
+        # pw runs in a dedicated Safari window (separate from any user
+        # window), this swap never touches the user's tabs — but we still
+        # restore so that another pw tab the caller was on stays current.
         try:
             finder = self._find_tab_jxa()
             _jxa(
                 f'var safari = Application("Safari"); {finder} '
                 f'try {{ __pw_win.currentTab = __pw_win.tabs[{original_tab}]; }} catch(e) {{}}'
             )
-        except PwError as e:
-            print(f"pw: warning — could not restore your Safari tab: {e}", file=sys.stderr)
+        except PwError:
+            pass
 
     def dismiss_popups(self):
         """Dismiss common popups, cookie banners, and marketing modals."""
@@ -1521,6 +1536,12 @@ def _sanitize_state(state):
     if not isinstance(url, str):
         url = ""
     state["url"] = url
+    # window_id: Safari's stable per-window integer id. Optional — older
+    # state files won't have one; the resolver will record one on next use.
+    wid = state.get("window_id")
+    if isinstance(wid, bool) or not isinstance(wid, int) or wid <= 0:
+        wid = None
+    state["window_id"] = wid
     return state
 
 
@@ -1588,28 +1609,28 @@ def _new_session_id():
     return f"pw_{os.getpid()}_{int(time.time() * 1000) % 1000000}_{_session_counter}"
 
 
-def _safari_create_new_tab(session_id=None):
-    """Create a new tab in the frontmost Safari window.
+def _safari_create_new_tab(session_id=None, existing_window_id=None):
+    """Create a new tab in pw's dedicated Safari window.
 
-    Never creates new windows — only adds a tab to an existing window.
-    Only creates a window if Safari has zero windows open.
-    Returns (window_index, tab_index, session_id).
+    pw owns its own Safari window(s); user tabs live in their own. This
+    isolation means screenshot's currentTab swap, tab close, and tab
+    creation never touch the user's tabs.
 
-    Navigates the new tab to about:blank so doJavaScript has a document
-    to run against (a freshly-pushed Safari Tab object has no document
-    and silently swallows JS), then injects window.__pw_session_id and
-    window.__pw_managed. The resolver can then find this tab on
-    subsequent commands without waiting for nav() to inject the marker.
-    If session_id is None, a fresh one is minted.
+    Window resolution order:
+      1. If `existing_window_id` is provided and that window still
+         exists, reuse it.
+      2. Otherwise scan for ANY window already containing a __pw_managed
+         tab and reuse that — pw sessions share one off-screen window.
+      3. Otherwise create a brand-new Safari window and move it
+         off-screen so it doesn't visually disrupt the user. The window's
+         backing buffer still exists for screencapture -l<id>.
+
+    Returns (window_index, tab_index, session_id, window_id). The data:
+    URL the tab is navigated to bakes in the session marker so the
+    resolver can find it on subsequent commands without waiting for
+    nav() to inject anything.
     """
     sid = session_id or _new_session_id()
-    # Bake the marker into the initial URL via a data: page. This survives
-    # the navigation race: setting url="about:blank" reports readyState
-    # "complete" instantly (from the prior empty doc), but about:blank
-    # then finishes loading and replaces the window object, wiping any
-    # marker we injected during that window. With a data: URL the marker
-    # is part of the rendered document itself, so it's there as soon as
-    # the page is loaded.
     blank_html = (
         f"<!doctype html><title>pw</title>"
         f"<script>window.__pw_session_id={json.dumps(sid)};"
@@ -1617,17 +1638,67 @@ def _safari_create_new_tab(session_id=None):
     )
     data_url = "data:text/html;charset=utf-8," + urllib.parse.quote(blank_html)
     url_js = json.dumps(data_url)
+    win_id_hint = json.dumps(existing_window_id) if existing_window_id else "null"
     script = f'''
     var safari = Application("Safari");
+    var hintId = {win_id_hint};
+    var win = null;
+    var winIdx = -1;
 
-    // Only create a window if none exist
-    if (safari.windows.length === 0) {{
-        safari.Document().make();
-        delay(0.3);
+    // 1. Reuse pw window by recorded id, if still valid.
+    if (hintId !== null) {{
+        for (var i = 0; i < safari.windows.length; i++) {{
+            try {{
+                if (safari.windows[i].id() === hintId) {{
+                    win = safari.windows[i];
+                    winIdx = i;
+                    break;
+                }}
+            }} catch(e) {{}}
+        }}
     }}
 
-    // Use frontmost window (windows[0] in z-order)
-    var win = safari.windows[0];
+    // 2. Look for any existing pw-managed window to share. Safari's JXA
+    // window.close() is unreliable, so pw windows accumulate across
+    // sessions otherwise — sharing keeps us at one off-screen window.
+    if (!win) {{
+        for (var sw = 0; sw < safari.windows.length; sw++) {{
+            var hit = false;
+            for (var st = 0; st < safari.windows[sw].tabs.length; st++) {{
+                try {{
+                    var m = safari.doJavaScript(
+                        "window.__pw_managed === true ? 1 : 0",
+                        {{in: safari.windows[sw].tabs[st]}}
+                    );
+                    if (m === 1) {{ hit = true; break; }}
+                }} catch(e) {{}}
+            }}
+            if (hit) {{ win = safari.windows[sw]; winIdx = sw; break; }}
+        }}
+    }}
+
+    // 3. Create a brand-new off-screen window. Snapshot ids before/after
+    // make() so we can identify the new one regardless of z-order, then
+    // push it off-screen. We never call safari.activate().
+    if (!win) {{
+        var before = {{}};
+        for (var b = 0; b < safari.windows.length; b++) {{
+            try {{ before[safari.windows[b].id()] = true; }} catch(e) {{}}
+        }}
+        safari.Document().make();
+        delay(0.2);
+        for (var k = 0; k < safari.windows.length; k++) {{
+            try {{
+                var kid = safari.windows[k].id();
+                if (!before[kid]) {{ win = safari.windows[k]; winIdx = k; break; }}
+            }} catch(e) {{}}
+        }}
+        if (win) {{
+            try {{ win.bounds = {{x: -32000, y: -32000, width: 1024, height: 768}}; }} catch(e) {{}}
+        }}
+    }}
+
+    if (!win) {{ throw new Error("could not create pw Safari window"); }}
 
     // Push tab, then assign URL. Safari's JXA Tab() constructor doesn't
     // accept {{url: ...}}; the URL must be set after push.
@@ -1646,45 +1717,58 @@ def _safari_create_new_tab(session_id=None):
         delay(0.05);
     }}
 
-    JSON.stringify({{window_index: 0, tab_index: tabIdx}});
+    // Re-resolve winIdx in case window order shifted while we waited.
+    var finalWinId = null;
+    try {{ finalWinId = win.id(); }} catch(e) {{}}
+    if (finalWinId !== null) {{
+        for (var m = 0; m < safari.windows.length; m++) {{
+            try {{
+                if (safari.windows[m].id() === finalWinId) {{ winIdx = m; break; }}
+            }} catch(e) {{}}
+        }}
+    }}
+
+    JSON.stringify({{window_index: winIdx, tab_index: tabIdx, window_id: finalWinId}});
     '''
     raw = _jxa(script)
     result = json.loads(raw) if raw else {}
-    return (result.get("window_index", 0), result.get("tab_index", 0), sid)
+    return (
+        result.get("window_index", 0),
+        result.get("tab_index", 0),
+        sid,
+        result.get("window_id"),
+    )
 
 
 def _resolve_safari_tab(create_if_missing=False):
     """Resolve the correct Safari (window_idx, tab_idx, session_id).
 
-    Uses session marker (window.__pw_session_id) first, then URL match,
-    then falls back to stored indices. Scans ALL windows, not just windows[0].
-
-    When create_if_missing=True and a named session's tab cannot be found,
-    creates a new tab instead of falling back to the user's current tab.
-    Any new tab is created with its session marker injected at creation
-    time, and state is updated to match.
+    Uses session marker (window.__pw_session_id) first, then URL match
+    (only if the matched tab also carries __pw_managed), then creates a
+    fresh managed tab. NEVER returns indices that point at a tab pw
+    didn't create — returning (0, 0, '') would target whatever tab the
+    user has frontmost.
 
     Returns (window_idx, tab_idx, session_id).
     """
     state = _read_tab_state()
     if not state:
-        if _session_name or create_if_missing:
-            # Named session with no state — ALWAYS create a new tab.
-            # Never fall back to tab 0 (user's tab).
-            win_idx, tab_idx, sid = _safari_create_new_tab()
-            _write_tab_state({
-                "session_id": sid,
-                "url": "",
-                "tab_index": tab_idx,
-                "window_index": win_idx,
-            })
-            return (win_idx, tab_idx, sid)
-        return (0, 0, "")
+        # No state — always create a fresh managed tab in pw's own window.
+        win_idx, tab_idx, sid, win_id = _safari_create_new_tab()
+        _write_tab_state({
+            "session_id": sid,
+            "url": "",
+            "tab_index": tab_idx,
+            "window_index": win_idx,
+            "window_id": win_id,
+        })
+        return (win_idx, tab_idx, sid)
 
     session_id = state.get("session_id", "")
     stored_url = state.get("url", "")
     stored_idx = state.get("tab_index", 0)
     stored_win = state.get("window_index", 0)
+    stored_win_id = state.get("window_id")
 
     # For named sessions, also accept the deterministic marker. State files
     # written before deterministic sids existed have random ids; both should
@@ -1697,10 +1781,9 @@ def _resolve_safari_tab(create_if_missing=False):
         if det_sid not in sid_candidates:
             sid_candidates.append(det_sid)
 
-    if not sid_candidates and not stored_url:
-        return (stored_win, stored_idx, session_id)
-
-    # Scan ALL windows and tabs for session marker, then URL
+    # Scan ALL windows and tabs for the session marker. URL-match is a
+    # secondary signal — only trust it if the matched tab ALSO carries a
+    # __pw_managed flag, because users can navigate any tab to any URL.
     scan_js = f'''
     var safari = Application("Safari");
     var markerWin = -1, markerTab = -1, markerSid = "";
@@ -1728,7 +1811,13 @@ def _resolve_safari_tab(create_if_missing=False):
             try {{
                 if (targetUrl && urlWin < 0) {{
                     var u = safari.windows[w].tabs[t].url();
-                    if (u === targetUrl) {{ urlWin = w; urlTab = t; }}
+                    if (u === targetUrl) {{
+                        var managed = safari.doJavaScript(
+                            "window.__pw_managed === true ? 1 : 0",
+                            {{in: safari.windows[w].tabs[t]}}
+                        );
+                        if (managed === 1) {{ urlWin = w; urlTab = t; }}
+                    }}
                 }}
             }} catch(e) {{}}
         }}
@@ -1744,23 +1833,31 @@ def _resolve_safari_tab(create_if_missing=False):
         marker_sid = result.get("markerSid", "") or session_id
         url_win = result.get("urlWin", -1)
         url_tab = result.get("urlTab", -1)
-        win_count = result.get("winCount", 0)
 
         if marker_win >= 0 and marker_tab >= 0:
-            # If we found the tab under a different sid (e.g. legacy random
-            # sid in state vs. deterministic marker on the tab), upgrade
-            # state to the marker we actually found so subsequent scans
-            # stay consistent.
             new_state_needed = (
                 marker_win != stored_win
                 or marker_tab != stored_idx
                 or (marker_sid and marker_sid != session_id)
+                or stored_win_id is None
             )
             if new_state_needed:
                 state["tab_index"] = marker_tab
                 state["window_index"] = marker_win
                 if marker_sid:
                     state["session_id"] = marker_sid
+                # Capture window_id for the located window so future tab
+                # creations can reuse it directly.
+                try:
+                    wid_raw = _jxa(
+                        f'Application("Safari").windows[{marker_win}].id();',
+                        timeout=3,
+                    )
+                    wid = int(wid_raw) if wid_raw and wid_raw.isdigit() else None
+                    if wid:
+                        state["window_id"] = wid
+                except (PwError, ValueError):
+                    pass
                 _write_tab_state(state)
             return (marker_win, marker_tab, marker_sid)
         if url_win >= 0 and url_tab >= 0:
@@ -1770,74 +1867,50 @@ def _resolve_safari_tab(create_if_missing=False):
                 _write_tab_state(state)
             return (url_win, url_tab, session_id)
 
-        # Neither marker nor URL found — tab is gone or user navigated it away
-        if create_if_missing and _session_name:
-            win_idx, tab_idx, sid = _safari_create_new_tab()
-            state["tab_index"] = tab_idx
-            state["window_index"] = win_idx
-            state["session_id"] = sid
-            state["url"] = ""
-            _write_tab_state(state)
-            return (win_idx, tab_idx, sid)
-
-        # Validate stored index is in range
-        if stored_win >= win_count and win_count > 0:
-            if _session_name:
-                # Session window out of range — create new, never touch user tabs
-                win_idx, tab_idx, sid = _safari_create_new_tab()
-                state["tab_index"] = tab_idx
-                state["window_index"] = win_idx
-                state["session_id"] = sid
-                state["url"] = ""
-                _write_tab_state(state)
-                return (win_idx, tab_idx, sid)
-            return (0, 0, "")  # no session — legacy fallback
+        # Neither marker nor managed-URL match. Tab is gone (closed, or
+        # user-navigated and we refuse to reclaim it). Mint a fresh tab
+        # in pw's own window, reusing stored window_id when valid.
+        win_idx, tab_idx, sid, win_id = _safari_create_new_tab(
+            existing_window_id=stored_win_id
+        )
+        state["tab_index"] = tab_idx
+        state["window_index"] = win_idx
+        state["session_id"] = sid
+        state["url"] = ""
+        state["window_id"] = win_id
+        _write_tab_state(state)
+        return (win_idx, tab_idx, sid)
     except (PwError, json.JSONDecodeError):
         pass
 
-    # Final safety: if we have a named session and stored indices are both 0,
-    # verify it's actually our tab before using it
-    if _session_name and stored_win == 0 and stored_idx == 0:
-        try:
-            check = _jxa(f'''
-            var safari = Application("Safari");
-            var tab = safari.windows[0].tabs[0];
-            safari.doJavaScript("window.__pw_managed === true ? 'managed' : 'user'", {{in: tab}});
-            ''', timeout=3)
-            if check != "managed":
-                # Tab 0 is a user tab — create our own
-                win_idx, tab_idx, sid = _safari_create_new_tab()
-                if state:
-                    state["tab_index"] = tab_idx
-                    state["window_index"] = win_idx
-                    state["session_id"] = sid
-                    state["url"] = ""
-                    _write_tab_state(state)
-                return (win_idx, tab_idx, sid)
-        except PwError:
-            pass
-
-    return (stored_win, stored_idx, session_id)
+    # Scan failed (Safari error). Last resort: create a fresh tab. Still
+    # NEVER return stored indices — they may now point at a user tab.
+    win_idx, tab_idx, sid, win_id = _safari_create_new_tab(
+        existing_window_id=stored_win_id
+    )
+    state["tab_index"] = tab_idx
+    state["window_index"] = win_idx
+    state["session_id"] = sid
+    state["url"] = ""
+    state["window_id"] = win_id
+    _write_tab_state(state)
+    return (win_idx, tab_idx, sid)
 
 
 def safari_launch():
-    """Ensure Safari is running with a window (stays in background)."""
+    """Ensure Safari is running. Stays in background — does NOT touch any
+    existing user window, does NOT create a window (pw creates its own
+    dedicated window when it needs one). Inspecting the user's frontmost
+    tab here would itself be a form of taking-over-a-tab-we-don't-own."""
     script = '''
     var safari = Application("Safari");
     safari.launch();
-    delay(0.3);
-    if (safari.windows.length === 0) {
-        safari.Document().make();
-        delay(0.3);
-    }
-    var win = safari.windows[0];
-    JSON.stringify({tabs: win.tabs.length, url: win.currentTab.url(), title: win.currentTab.name()});
+    delay(0.2);
+    JSON.stringify({windows: safari.windows.length});
     '''
     raw = _jxa(script)
     info = json.loads(raw) if raw else {}
-    print(f"Safari ready. {info.get('tabs', '?')} tab(s) open.")
-    if info.get("url"):
-        print(f"Current: {info.get('title', '')} | {info['url']}")
+    print(f"Safari ready. {info.get('windows', '?')} window(s) open.")
 
 
 def safari_close():
@@ -1966,10 +2039,17 @@ def _safari_connect_and_run(fn):
         return fn(None, ctx, page)
     except PwError as e:
         err = str(e)
-        # Tab gone (closed by user) — create a new one and retry
-        tab_gone_patterns = ["(-1719)", "Can't get tab"]
-        if _session_name and any(p in err for p in tab_gone_patterns):
-            new_win, new_tab, new_sid = _safari_create_new_tab()
+        # Tab gone (closed by user, or finder threw __PW_TAB_GONE__
+        # because the marker couldn't be located). Create a new managed
+        # tab in pw's own window and retry. Never fall back to the
+        # user's frontmost tab.
+        tab_gone_patterns = ["(-1719)", "Can't get tab", "__PW_TAB_GONE__"]
+        if any(p in err for p in tab_gone_patterns):
+            prior = _read_tab_state() or {}
+            stored_win_id = prior.get("window_id") if isinstance(prior, dict) else None
+            new_win, new_tab, new_sid, new_win_id = _safari_create_new_tab(
+                existing_window_id=stored_win_id
+            )
             page = SafariPage(new_tab, session_id=new_sid, window_idx=new_win)
             ctx = _SafariCtx(window_idx=new_win)
             _write_tab_state({
@@ -1977,17 +2057,27 @@ def _safari_connect_and_run(fn):
                 "url": "",
                 "tab_index": new_tab,
                 "window_index": new_win,
+                "window_id": new_win_id,
             })
             return fn(None, ctx, page)
-        # Safari not running or no window — launch and retry once
+        # Safari not running or no window — launch and retry once via the
+        # normal create path; never assume windows[0]/tabs[0].
         recoverable = [
             "(-1719)", "Can't get window", "windows doesn't understand",
             "(-600)", "not running",
         ]
         if any(pattern in err for pattern in recoverable):
             safari_launch()
-            page = SafariPage(0, session_id=session_id or None, window_idx=0)
-            ctx = _SafariCtx(window_idx=0)
+            new_win, new_tab, new_sid, new_win_id = _safari_create_new_tab()
+            _write_tab_state({
+                "session_id": new_sid,
+                "url": "",
+                "tab_index": new_tab,
+                "window_index": new_win,
+                "window_id": new_win_id,
+            })
+            page = SafariPage(new_tab, session_id=new_sid, window_idx=new_win)
+            ctx = _SafariCtx(window_idx=new_win)
             return fn(None, ctx, page)
         raise
 
@@ -2022,15 +2112,34 @@ def cmd_doctor():
         else:
             print(f"  [ok] Can reach Safari (may need to approve dialog on first real use)")
 
-    # 3. Allow JavaScript from Apple Events
+    # 3. Allow JavaScript from Apple Events. Create a throwaway window
+    # for the probe rather than poking at safari.windows[0].currentTab
+    # (the user's frontmost tab). The probe window is closed immediately.
     try:
         _jxa('''
         var safari = Application("Safari");
         safari.launch();
-        delay(0.5);
-        if (safari.windows.length === 0) safari.Document().make();
         delay(0.3);
-        safari.doJavaScript("1+1", {in: safari.windows[0].currentTab});
+        var before = {};
+        for (var b = 0; b < safari.windows.length; b++) {
+            try { before[safari.windows[b].id()] = true; } catch(e) {}
+        }
+        safari.Document().make();
+        delay(0.2);
+        var probeWin = null;
+        for (var k = 0; k < safari.windows.length; k++) {
+            try {
+                var kid = safari.windows[k].id();
+                if (!before[kid]) { probeWin = safari.windows[k]; break; }
+            } catch(e) {}
+        }
+        if (probeWin) {
+            try { probeWin.bounds = {x: -32000, y: -32000, width: 800, height: 600}; } catch(e) {}
+            safari.doJavaScript("1+1", {in: probeWin.currentTab});
+            try { probeWin.close(); } catch(e) {}
+        } else {
+            throw new Error("could not create probe window");
+        }
         ''')
         print("  [ok] 'Allow JavaScript from Apple Events' is enabled")
     except PwError as e:
@@ -2400,11 +2509,14 @@ def cmd_tab(index):
         if idx < 0 or idx >= len(pages):
             raise PwError(f"Tab {idx} not found. {len(pages)} tabs open.")
         pages[idx].bring_to_front()
+        prior = _read_tab_state() or {}
+        prior_wid = prior.get("window_id") if isinstance(prior, dict) else None
         _write_tab_state({
             "session_id": page._session_id if hasattr(page, '_session_id') else "",
             "url": pages[idx].url,
             "tab_index": idx,
             "window_index": page._win if hasattr(page, '_win') else 0,
+            "window_id": prior_wid,
         })
         print(f"Switched to tab {idx}: {pages[idx].title()} | {pages[idx].url}")
 
@@ -2728,9 +2840,21 @@ def main():
         raw_session = os.environ["PW_SESSION"]
 
     # Auto-session: when running inside Claude Code and no explicit session,
-    # default to "claude" session to avoid hijacking user tabs
-    if raw_session is None and os.environ.get("CLAUDE_CODE"):
+    # use a "claude" session so state files are distinct from manual CLI use.
+    # Claude Code sets CLAUDECODE=1 (no underscore) — accept several variants
+    # in case the entrypoint shape changes.
+    if raw_session is None and (
+        os.environ.get("CLAUDECODE")
+        or os.environ.get("CLAUDE_CODE")
+        or os.environ.get("CLAUDE_CODE_ENTRYPOINT")
+    ):
         raw_session = "claude"
+
+    # Always operate inside a named session. Without this fallback, pw would
+    # target safari.windows[0].tabs[0] — i.e., whatever tab the user has
+    # frontmost — which is exactly the tab-hijacking we must never do.
+    if raw_session is None:
+        raw_session = "default"
 
     if raw_session is not None:
         try:

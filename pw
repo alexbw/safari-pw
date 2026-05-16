@@ -31,8 +31,6 @@ Usage:
     pw status                         Check if browser is running
     pw doctor                         Check Safari setup (permissions, settings)
     pw batch "CMD1" "CMD2" ...        Run multiple commands in one connection (faster)
-    pw fetch URL [--to PATH]          Fetch URL using the tab's session (sends HttpOnly cookies)
-    pw cookies [--format FMT]         Print cookies for the current tab (json|header|netscape)
     pw react-click SELECTOR           Click via React fiber (background-safe, for MUI/React)
     pw react-set SEL PROP VALUE       Set React component value via handler (e.g. onChange)
     pw ng-click SELECTOR              Click via AngularJS triggerHandler (fires ng-click)
@@ -2789,145 +2787,6 @@ def cmd_status():
     safari_status()
 
 
-def cmd_cookies(fmt="json", name_filter=None):
-    """Read cookies from the current pw tab via `document.cookie`.
-
-    Limitation: HttpOnly cookies are not exposed to JavaScript and will
-    NOT appear here. For HttpOnly-only sessions (most modern auth), use
-    `pw download` to let Safari itself send the cookies, instead of
-    handing them to a separate HTTP client.
-    """
-    def do(browser, ctx, page):
-        raw = page.evaluate("document.cookie")
-        if not raw or raw == "null":
-            cookies = []
-        else:
-            cookies = []
-            for piece in str(raw).split("; "):
-                if not piece:
-                    continue
-                if "=" in piece:
-                    k, _, v = piece.partition("=")
-                else:
-                    k, v = piece, ""
-                cookies.append((k.strip(), v))
-        if name_filter:
-            cookies = [(k, v) for k, v in cookies if k == name_filter]
-        if fmt == "json":
-            print(json.dumps([{"name": k, "value": v} for k, v in cookies], indent=2))
-        elif fmt == "header":
-            # ready to paste after `curl -H "Cookie: ..."` or as `-b`
-            print("; ".join(f"{k}={v}" for k, v in cookies))
-        elif fmt == "netscape":
-            # Netscape cookies.txt format — domain unknown from JS, leave blank
-            # so the caller can fill it in. Format: domain TAB tailmatch TAB
-            # path TAB secure TAB expiry TAB name TAB value
-            for k, v in cookies:
-                print(f"\tTRUE\t/\tFALSE\t0\t{k}\t{v}")
-        else:
-            raise PwError(f"Unknown cookies format: {fmt!r} (use json|header|netscape)")
-
-    connect_and_run(do)
-
-
-def cmd_fetch(url, to=None, method="GET", timeout=30):
-    """Fetch a URL using the current tab's browser session.
-
-    Runs fetch() inside the tab's JS context so the browser sends every
-    cookie associated with the request — including HttpOnly ones that
-    `pw cookies` can't see. Bound by the browser's same-origin rules: a
-    cross-origin target without CORS headers will fail just as it would
-    in regular page JS.
-
-    Text bodies only. Binary content survives the JXA string transport
-    intact for ASCII-safe payloads (CSV, JSON, XML); arbitrary binary may
-    corrupt — for those, use `pw cookies` and curl with `--cookie`.
-    """
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-
-    def do(browser, ctx, page):
-        url_lit = json.dumps(url)
-        method_lit = json.dumps(method.upper())
-        # Kick off the fetch and stash on window; poll for completion.
-        # Doing it in two phases (start, then poll) avoids relying on
-        # doJavaScript awaiting promises (it doesn't).
-        #
-        # Pre-wrap as an IIFE so _wrap_multi_statement_js leaves it alone.
-        # Its naive split-on-`;` would otherwise tear apart the nested
-        # .then() callback bodies and produce broken JS.
-        page.evaluate(f"""(function() {{
-            window.__pw_fetch_done = false;
-            window.__pw_fetch_err = null;
-            window.__pw_fetch_body = null;
-            window.__pw_fetch_status = 0;
-            fetch({url_lit}, {{credentials: 'include', method: {method_lit}}})
-              .then(function(r) {{
-                  window.__pw_fetch_status = r.status;
-                  if (!r.ok) {{ throw new Error('HTTP ' + r.status); }}
-                  return r.text();
-              }})
-              .then(function(t) {{
-                  window.__pw_fetch_body = t;
-                  window.__pw_fetch_done = true;
-              }})
-              .catch(function(e) {{
-                  window.__pw_fetch_err = String(e && e.message ? e.message : e);
-                  window.__pw_fetch_done = true;
-              }});
-            return "started";
-        }})()""")
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            time.sleep(0.3)
-            done = page.evaluate("window.__pw_fetch_done === true ? 1 : 0")
-            if done == 1 or done == "1":
-                break
-        else:
-            raise PwError(f"fetch did not complete within {timeout}s")
-
-        # Wrap each value in an object so page.evaluate's auto-JSON-parse
-        # doesn't reinterpret a JSON-shaped response body as a dict. We
-        # want the body verbatim.
-        result = page.evaluate(
-            "JSON.stringify({"
-            "  err: window.__pw_fetch_err,"
-            "  status: window.__pw_fetch_status,"
-            "  body: window.__pw_fetch_body"
-            "})"
-        )
-        if not isinstance(result, dict):
-            raise PwError(f"unexpected fetch state: {result!r}")
-        if result.get("err"):
-            raise PwError(
-                f"fetch failed (status={result.get('status')}): {result['err']}"
-            )
-        body = result.get("body") or ""
-
-        # Cleanup
-        page.evaluate(
-            "delete window.__pw_fetch_done; delete window.__pw_fetch_err; "
-            "delete window.__pw_fetch_body; delete window.__pw_fetch_status; "
-            "true"
-        )
-
-        if to:
-            to_abs = os.path.abspath(os.path.expanduser(to))
-            parent = os.path.dirname(to_abs)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(to_abs, "w") as f:
-                f.write(body if isinstance(body, str) else str(body))
-            print(to_abs)
-        else:
-            sys.stdout.write(body if isinstance(body, str) else str(body))
-            if not str(body).endswith("\n"):
-                sys.stdout.write("\n")
-
-    connect_and_run(do)
-
-
 # --- Argument validation & dispatch ---
 
 
@@ -2983,68 +2842,6 @@ def _ng_set_handler(args):
     if len(args) < 2:
         raise PwError("Usage: pw ng-set SELECTOR VALUE")
     cmd_ng_set(args[0], args[1])
-
-
-def _cookies_handler(args):
-    fmt = "json"
-    name_filter = None
-    i = 0
-    clean = []
-    while i < len(args):
-        if args[i] == "--format":
-            if i + 1 >= len(args):
-                raise PwError("--format requires a value (json|header|netscape)")
-            fmt = args[i + 1]
-            i += 2
-            continue
-        if args[i] == "--name":
-            # Note: pw's top-level --name (session) is stripped in main() before
-            # the handler runs, so any --name here is a cookie-name filter.
-            if i + 1 >= len(args):
-                raise PwError("--name requires a cookie name")
-            name_filter = args[i + 1]
-            i += 2
-            continue
-        clean.append(args[i])
-        i += 1
-    if clean:
-        raise PwError("Usage: pw cookies [--format json|header|netscape] [--name COOKIE]")
-    cmd_cookies(fmt=fmt, name_filter=name_filter)
-
-
-def _fetch_handler(args):
-    to = None
-    method = "GET"
-    timeout = 30
-    clean = []
-    i = 0
-    while i < len(args):
-        if args[i] == "--to":
-            if i + 1 >= len(args):
-                raise PwError("--to requires a path")
-            to = args[i + 1]
-            i += 2
-            continue
-        if args[i] == "--method":
-            if i + 1 >= len(args):
-                raise PwError("--method requires a value (GET|POST|...)")
-            method = args[i + 1]
-            i += 2
-            continue
-        if args[i] == "--timeout":
-            if i + 1 >= len(args):
-                raise PwError("--timeout requires seconds")
-            try:
-                timeout = int(args[i + 1])
-            except ValueError:
-                raise PwError(f"--timeout: not an integer: {args[i + 1]!r}")
-            i += 2
-            continue
-        clean.append(args[i])
-        i += 1
-    if not clean:
-        raise PwError("Usage: pw fetch URL [--to PATH] [--method M] [--timeout SECONDS]")
-    cmd_fetch(clean[0], to=to, method=method, timeout=timeout)
 
 
 def _back_handler(args):
@@ -3260,8 +3057,6 @@ COMMANDS = {
     "doctor":     {"handler": lambda args: cmd_doctor(),               "min_args": 0},
     "batch":      {"handler": lambda args: cmd_batch(args),            "min_args": 1, "usage": "pw batch \"CMD1\" \"CMD2\" ..."},
     "dismiss":    {"handler": lambda args: cmd_dismiss(),              "min_args": 0},
-    "fetch":      {"handler": _fetch_handler,                          "min_args": 1, "usage": "pw fetch URL [--to PATH] [--method M] [--timeout SECONDS]"},
-    "cookies":    {"handler": _cookies_handler,                        "min_args": 0, "usage": "pw cookies [--format json|header|netscape] [--name COOKIE]"},
 }
 
 

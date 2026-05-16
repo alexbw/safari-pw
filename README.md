@@ -112,8 +112,6 @@ pw close                # close pw's tracked tab (or scrub state)
 pw status               # is Safari running?
 pw doctor               # check setup
 pw batch "CMD1" "CMD2" ...   # run multiple commands in one connection (faster)
-pw fetch URL [--to PATH]     # HTTP GET via the tab's session (sends HttpOnly cookies)
-pw cookies [--format FMT]    # print document.cookie for the current tab
 ```
 
 Run `pw` with no arguments for the full reference.
@@ -160,27 +158,6 @@ pw ng-click "#submitBtn"                # → angular.element(el).triggerHandler
 ```
 
 Both go through `$scope.$apply()`, so watchers fire and form state (`$valid`, `$touched`, etc.) updates the same way it does for a real keystroke or click.
-
-### Downloading from an authenticated session
-
-Safari blocks downloads triggered from JXA — its security model requires a real user gesture (a physical mouse click or address-bar Enter) to save a file. So `pw click` on a download button does nothing, and navigating to a `Content-Disposition: attachment` URL is silently dropped.
-
-The workaround is to bypass the download UI entirely and do an in-page `fetch()`, which runs in the browser's JS context and sends every cookie associated with the request — HttpOnly ones included:
-
-```bash
-# Log in normally in pw's tab, then:
-pw fetch "https://app.example.com/export/orders.csv" --to ~/orders.csv
-```
-
-If the target accepts cross-origin requests or shares an origin with the tab, this just works. For sites that ban the page's origin from fetching the export endpoint, fall back to `pw cookies` and curl:
-
-```bash
-pw cookies --format header
-# → ab=12; cd=34; csrf=abc123
-curl -b "$(pw cookies --format header)" https://app.example.com/export/orders.csv -o orders.csv
-```
-
-`pw cookies` can only see what `document.cookie` exposes — HttpOnly cookies (where most auth tokens live in 2026) won't appear. For those sessions, stick with `pw fetch`.
 
 ### Talking to Safari is slow — batch when you can
 

@@ -251,57 +251,10 @@ class TestCommandsDict:
             "launch", "nav", "click", "fill", "type", "press", "select",
             "screenshot", "snap", "text", "html", "eval", "title", "url",
             "links", "wait", "tabs", "tab", "back", "close", "status",
-            "doctor", "batch", "fetch", "cookies",
+            "doctor", "batch",
         }
         missing = required - set(pw.COMMANDS.keys())
         assert not missing, f"required commands missing: {missing}"
-
-
-class TestFetchCookies:
-    """CLI/dispatch unit tests for the fetch/cookies commands — no browser."""
-
-    def test_fetch_missing_url(self):
-        code, out, err = run_pw("fetch")
-        assert code == 1
-        assert "Usage: pw fetch URL" in err
-
-    def test_fetch_to_requires_value(self):
-        code, out, err = run_pw("fetch", "https://example.com/x", "--to")
-        assert code == 1
-        assert "--to requires a path" in err
-
-    def test_fetch_method_requires_value(self):
-        code, out, err = run_pw("fetch", "https://example.com/x", "--method")
-        assert code == 1
-        assert "--method requires" in err
-
-    def test_fetch_timeout_non_integer(self):
-        code, out, err = run_pw("fetch", "https://example.com/x", "--timeout", "abc")
-        assert code == 1
-        assert "not an integer" in err
-
-    def test_cookies_unknown_format(self):
-        code, out, err = run_pw("cookies", "--format", "yaml")
-        assert code == 1
-        assert "Unknown cookies format" in err or "use json|header|netscape" in err
-
-    def test_cookies_format_requires_value(self):
-        code, out, err = run_pw("cookies", "--format")
-        assert code == 1
-        assert "--format requires" in err
-
-    def test_cookies_name_requires_value(self):
-        # --name as cookies-arg (the session --name is stripped earlier in main)
-        code, out, err = run_pw("cookies", "--format", "json", "--name")
-        assert code == 1
-        # Top-level --name parser catches the missing-value first; either
-        # message is acceptable as long as we exit non-zero with usage.
-        assert "name" in err.lower()
-
-    def test_cookies_rejects_positional(self):
-        code, out, err = run_pw("cookies", "extra-arg")
-        assert code == 1
-        assert "Usage: pw cookies" in err
 
 
 # ============================================================================

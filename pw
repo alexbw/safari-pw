@@ -31,6 +31,9 @@ Usage:
     pw status                         Check if browser is running
     pw doctor                         Check Safari setup (permissions, settings)
     pw batch "CMD1" "CMD2" ...        Run multiple commands in one connection (faster)
+    pw trusted-click SELECTOR         Real OS-level click (passes WebKit isTrusted check)
+    pw download SEL_OR_URL [--to P]   Trusted-click + capture resulting file from ~/Downloads
+    pw importinfo-export INDEX --to DIR [--limit N|--only N]
     pw react-click SELECTOR           Click via React fiber (background-safe, for MUI/React)
     pw react-set SEL PROP VALUE       Set React component value via handler (e.g. onChange)
     pw ng-click SELECTOR              Click via AngularJS triggerHandler (fires ng-click)
@@ -87,6 +90,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from html.parser import HTMLParser
 from json import dumps as _json_escape
 
 SCREENSHOT_DEFAULT = "/tmp/pw-screenshot.png"
@@ -99,6 +103,23 @@ STATE_DIR = os.path.join(
     os.path.expanduser("~"), "Library", "Application Support", "safari-pw"
 )
 SAFARI_TAB_FILE = os.path.join(STATE_DIR, "default.json")
+# Native helper that posts real Quartz mouse events (isTrusted=true), used
+# by `pw trusted-click` and `pw download` to defeat WebKit's user-gesture
+# check on click handlers that trigger downloads, file pickers, etc.
+# Build by running `helpers/safari-trusted-click/build.sh` (or invoking
+# swiftc directly on the .swift source there).
+def _pw_script_dir():
+    # __file__ isn't defined under the test loader (importlib SourceFileLoader
+    # gives the module no __file__ attr). Fall back to sys.argv[0] in that case.
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+TRUSTED_CLICK_BIN = os.path.join(
+    _pw_script_dir(), "helpers", "safari-trusted-click", "safari-trusted-click",
+)
 # Registry of Safari window ids that pw has created and owns. Used to
 # distinguish "windows pw can safely bury / push tabs into" from
 # windows that just happen to contain an orphan __pw_managed marker (e.g.
@@ -2779,6 +2800,561 @@ def cmd_back(output_flag="text", output_selector=None):
     connect_and_run(do)
 
 
+# --- Trusted-click / download primitives ---
+
+
+def _safari_downloads_dir():
+    """Safari's configured download folder. Default ~/Downloads."""
+    domain = (
+        f"/Users/{os.environ.get('USER','')}/Library/Containers/"
+        "com.apple.Safari/Data/Library/Preferences/com.apple.Safari"
+    )
+    try:
+        r = subprocess.run(
+            ["defaults", "read", domain, "DownloadsPath"],
+            capture_output=True, text=True, timeout=3,
+        )
+        path = r.stdout.strip()
+        if r.returncode == 0 and path:
+            if path.startswith("file://"):
+                path = urllib.parse.unquote(path[len("file://"):])
+            return os.path.expanduser(path)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return os.path.expanduser("~/Downloads")
+
+
+def _snapshot_downloads(d):
+    """Map basename → mtime for everything currently under `d`."""
+    try:
+        return {n: os.path.getmtime(os.path.join(d, n)) for n in os.listdir(d)}
+    except OSError:
+        return {}
+
+
+def _wait_for_new_download(d, before, timeout=60, poll=0.3):
+    """Block until a new completed file appears under `d` and its size
+    stops changing across two consecutive polls. `.download` packages
+    (Safari's in-progress marker) are ignored — we wait for the rename
+    to the final filename. Returns the path, or None on timeout."""
+    deadline = time.time() + timeout
+    seen_size = {}
+    while time.time() < deadline:
+        time.sleep(poll)
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        candidates = []
+        for name in entries:
+            if name.endswith(".download"):
+                continue
+            full = os.path.join(d, name)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                continue
+            if before.get(name) is None or mtime > before[name] + 0.001:
+                candidates.append((mtime, full))
+        if candidates:
+            candidates.sort(reverse=True)
+            _, path = candidates[0]
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if seen_size.get(path) == size and size > 0:
+                return path
+            seen_size[path] = size
+    return None
+
+
+def _safari_raise_pw_window(window_id, session_id=None):
+    """Bring a pw-owned Safari window to the front of Safari's z-order AND
+    surface the pw session's tab as the window's current tab AND activate
+    Safari, so a CGEvent at the window's screen coordinates lands on the
+    page we actually drove. Returns the previously-frontmost app's bundle
+    id so the caller can restore focus after."""
+    proc = _osascript(
+        'tell application "System Events" to '
+        'get bundle identifier of first application process whose frontmost is true'
+    )
+    prior_app = (proc.stdout.decode("utf-8", "replace").strip()
+                 if proc and proc.stdout else "")
+    # Switch the window's currentTab to the pw session's tab BEFORE
+    # raising. Otherwise the user sees (and the click lands on) whatever
+    # tab happens to be selected — typically a stray favorites:// from
+    # window creation, or the original data:text/html marker tab whose
+    # __pw_session_id sentinel was baked into its source.
+    #
+    # We use _build_tab_finder_jxa, the same logic the rest of pw uses
+    # for tab resolution: tab_index hint first (most reliable), falling
+    # back to a session_id marker scan only if the index is stale. This
+    # avoids the "two tabs share the marker" failure where a naive scan
+    # picks the wrong one.
+    if window_id and session_id:
+        # Walk every tab in the pw window, match by the session sentinel
+        # baked into the page's window object, and set currentTab by INDEX
+        # (not by tab-object identity — JXA's `===` between freshly-looked-up
+        # tab references on the same underlying tab returns false).
+        marker = json.dumps(session_id)
+        _jxa(f'''
+        var safari = Application("Safari");
+        for (var w = 0; w < safari.windows.length; w++) {{
+            try {{
+                var win = safari.windows[w];
+                if (win.id() !== {int(window_id)}) continue;
+                for (var t = 0; t < win.tabs.length; t++) {{
+                    try {{
+                        var sid = safari.doJavaScript(
+                            "window.__pw_session_id || ''",
+                            {{in: win.tabs[t]}}
+                        );
+                        if (sid === {marker}) {{
+                            win.currentTab = win.tabs[t];
+                            break;
+                        }}
+                    }} catch(e) {{}}
+                }}
+                break;
+            }} catch(e) {{}}
+        }}
+        "ok";
+        ''')
+    if window_id:
+        _osascript(
+            f'tell application "Safari" to '
+            f'set index of (every window whose id is {int(window_id)}) to 1'
+        )
+    _osascript('tell application "Safari" to activate')
+    # Give Safari time to (a) finish the raise + focus and (b) rebuild its
+    # AX representation of the now-active tab's web content. WebContent
+    # populates the AX tree lazily on focus; a search before it's done
+    # returns "element not found" even though the page is fully rendered.
+    # 1.0s is empirically enough for our test pages; bump if you see
+    # "no AXPress-supporting element named X" failures.
+    time.sleep(1.0)
+    return prior_app
+
+
+def _safari_restore_after_click(window_id, prior_app_bid):
+    """Re-bury the pw window and return focus to whichever app was front
+    before _safari_raise_pw_window. Symmetric with that call."""
+    if window_id:
+        _bury_pw_window(window_id)
+    if prior_app_bid and prior_app_bid != "com.apple.Safari":
+        # `tell application id "..." to activate` is the only reliable
+        # way to restore arbitrary apps; the alternative (System Events
+        # setting frontmost=true) doesn't survive race conditions with
+        # Mission Control / Spaces.
+        _osascript(f'tell application id "{prior_app_bid}" to activate')
+
+
+def _dismiss_safari_download_sheets(window_id, timeout=2.5):
+    """Auto-accept any native Safari sheet that's blocking the page after
+    a download click. Covers:
+      - 'Do you want to allow downloads on X?' (per-origin, first time)
+      - 'Confirm Download' file-save prompts when Safari is set to ask
+    Tries the common button labels; bails quietly if no sheet appears.
+
+    Requires Accessibility permission (System Events scripting). The
+    sheets live on the Safari window, so a buried window's sheets may
+    not be reachable — call this only while the window is raised."""
+    button_labels = ["Allow", "Allow Once", "Download", "Save", "OK"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for label in button_labels:
+            script = (
+                'tell application "System Events"\n'
+                '  tell process "Safari"\n'
+                '    try\n'
+                f'      if exists sheet 1 of (first window whose subrole is "AXStandardWindow") then\n'
+                f'        click button "{label}" of sheet 1 of '
+                '         (first window whose subrole is "AXStandardWindow")\n'
+                '        return "clicked"\n'
+                '      end if\n'
+                '    end try\n'
+                '  end tell\n'
+                'end tell\n'
+                'return "nope"'
+            )
+            proc = _osascript(script)
+            out = (proc.stdout.decode("utf-8", "replace").strip()
+                   if proc and proc.stdout else "")
+            if out == "clicked":
+                return True
+        time.sleep(0.2)
+    return False
+
+
+def _element_screen_point(page, selector):
+    """Return (screen_x, screen_y, window_id) of a CSS selector's center,
+    after scrolling it into view. Coords are in points, top-left origin,
+    suitable for CGEventCreateMouseEvent. Raises PwError if not found."""
+    sel_js = _translate_selector(selector)
+    js = (
+        "(function(){"
+        f"  var el = {sel_js};"
+        "  if (!el) return null;"
+        "  el.scrollIntoView({block: 'center', inline: 'center'});"
+        "  var r = el.getBoundingClientRect();"
+        "  var chrome = window.outerHeight - window.innerHeight;"
+        "  return JSON.stringify({"
+        "    x: window.screenX + r.left + r.width/2,"
+        "    y: window.screenY + chrome + r.top + r.height/2,"
+        "    width: r.width, height: r.height"
+        "  });"
+        "})()"
+    )
+    raw = page.evaluate(js)
+    if raw is None or raw == "null" or not raw:
+        raise PwError(f"Element not found: {selector}")
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            raise PwError(f"Could not parse element rect: {raw!r}")
+    else:
+        data = raw
+    if not data or data.get("width", 0) <= 0 or data.get("height", 0) <= 0:
+        raise PwError(f"Element has zero size or is detached: {selector}")
+    state = _read_tab_state() or {}
+    window_id = state.get("window_id") if isinstance(state, dict) else None
+    return float(data["x"]), float(data["y"]), window_id
+
+
+def _element_ax_press_info(page, selector):
+    """Return AX lookup metadata for a selector after scrolling it into view.
+
+    The Swift helper resolves the final target inside Safari's accessibility
+    tree. JS is only used here to identify the element's accessible-ish name,
+    not to convert DOM coordinates into screen coordinates.
+    """
+    sel_js = _translate_selector(selector)
+    js = (
+        "(function(){"
+        f"  var el = {sel_js};"
+        "  if (!el) return null;"
+        "  el.scrollIntoView({block: 'center', inline: 'center'});"
+        "  var tag = (el.tagName || '').toLowerCase();"
+        "  var role = el.getAttribute('role') || '';"
+        "  var label = el.getAttribute('aria-label') || el.getAttribute('title') || "
+        "    el.innerText || el.textContent || el.value || el.alt || '';"
+        "  label = String(label).replace(/\\s+/g, ' ').trim();"
+        "  var axRole = null;"
+        "  if (tag === 'a' || role === 'link') axRole = 'AXLink';"
+        "  else if (tag === 'button' || role === 'button' || "
+        "           (tag === 'input' && /^(button|submit|reset)$/i.test(el.type || ''))) axRole = 'AXButton';"
+        "  return JSON.stringify({label: label, role: axRole});"
+        "})()"
+    )
+    raw = page.evaluate(js)
+    if raw is None or raw == "null" or not raw:
+        raise PwError(f"Element not found: {selector}")
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            raise PwError(f"Could not parse element AX metadata: {raw!r}")
+    else:
+        data = raw
+    label = (data.get("label") or "").strip()
+    if not label:
+        raise PwError(f"Element has no accessible text for AXPress lookup: {selector}")
+    return label, data.get("role")
+
+
+def _trusted_click_at(x, y, *, pid=None):
+    """Dispatch one real left mouse down+up via the Swift helper. The
+    target window MUST be frontmost — Quartz hit-testing routes events
+    by screen position, not window id."""
+    if not os.path.isfile(TRUSTED_CLICK_BIN) or not os.access(TRUSTED_CLICK_BIN, os.X_OK):
+        raise PwError(
+            f"safari-trusted-click helper not built at {TRUSTED_CLICK_BIN}.\n"
+            "Build it with:\n"
+            "  cd helpers/safari-trusted-click && "
+            "swiftc -O SafariTrustedClick.swift -o safari-trusted-click"
+        )
+    cmd = [TRUSTED_CLICK_BIN, str(x), str(y)]
+    if pid is not None:
+        cmd += ["--pid", str(pid)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        raise PwError("safari-trusted-click timed out")
+    if r.returncode != 0:
+        raise PwError(
+            f"safari-trusted-click failed (code {r.returncode}): "
+            f"{r.stderr.strip() or r.stdout.strip()}"
+        )
+
+
+def _trusted_click_named(label, *, pid, role=None):
+    """Find and AXPress a named control in Safari's accessibility tree."""
+    if not os.path.isfile(TRUSTED_CLICK_BIN) or not os.access(TRUSTED_CLICK_BIN, os.X_OK):
+        raise PwError(
+            f"safari-trusted-click helper not built at {TRUSTED_CLICK_BIN}.\n"
+            "Build it with:\n"
+            "  cd helpers/safari-trusted-click && "
+            "swiftc -O SafariTrustedClick.swift -o safari-trusted-click"
+        )
+    if pid is None:
+        cmd = [TRUSTED_CLICK_BIN, "--bundle", "com.apple.Safari", "--name", label]
+    else:
+        cmd = [TRUSTED_CLICK_BIN, "--pid", str(pid), "--name", label]
+    if role:
+        cmd += ["--role", role]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+    except subprocess.TimeoutExpired:
+        raise PwError("safari-trusted-click timed out")
+    if r.returncode != 0:
+        raise PwError(
+            f"safari-trusted-click failed (code {r.returncode}): "
+            f"{r.stderr.strip() or r.stdout.strip()}"
+        )
+
+
+def _safari_pid():
+    """PID of the running Safari, or None."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-x", "Safari"], capture_output=True, text=True, timeout=2
+        ).stdout.strip().split("\n")
+        return int(out[0]) if out and out[0] else None
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        return None
+
+
+def cmd_trusted_click(selector, dismiss_sheets=True):
+    """Issue one real OS-level mouse click on a CSS selector. The pw
+    window is briefly raised (required — Quartz hit-tests by screen
+    position) and then re-buried; another app's frontmost is restored.
+
+    WebKit treats the resulting click as isTrusted=true, satisfying the
+    user-gesture requirement for downloads, file pickers, fullscreen,
+    clipboard write, and friends. Synthetic JS clicks (pw click) and
+    React/Angular handler invocations do not — so use this command only
+    when you specifically need a real user gesture.
+
+    Requires PW_ALLOW_FOREGROUND=1 to acknowledge the brief Safari raise.
+    """
+    _require_foreground_opt_in("pw trusted-click")
+
+    state_holder = {}
+
+    def collect(browser, ctx, page):
+        # First pass: get window_id + session_id while buried. Element
+        # coords measured here can be stale after raise (Safari toolbar
+        # state shifts on activate), so we re-measure post-raise below.
+        state = _read_tab_state() or {}
+        state_holder["wid"] = state.get("window_id") if isinstance(state, dict) else None
+        state_holder["sid"] = getattr(page, "_session_id", None)
+
+    connect_and_run(collect)
+
+    window_id = state_holder["wid"]
+    prior = _safari_raise_pw_window(window_id, session_id=state_holder.get("sid"))
+    try:
+        # Second pass: NOW measure element coords, with the window raised
+        # and its toolbar/chrome in its raised-state geometry. Prefer AX
+        # lookup by accessible name so Safari's JS screen metrics cannot
+        # drift from the native window-server coordinates.
+        def measure(browser, ctx, page):
+            label, role = _element_ax_press_info(page, selector)
+            state_holder["label"] = label
+            state_holder["role"] = role
+        connect_and_run(measure)
+
+        _trusted_click_named(
+            state_holder["label"],
+            pid=_safari_pid(),
+            role=state_holder.get("role"),
+        )
+        if dismiss_sheets:
+            # Stay raised briefly so any sheet has time to appear before
+            # we look for it.
+            time.sleep(0.4)
+            _dismiss_safari_download_sheets(window_id)
+    finally:
+        _safari_restore_after_click(window_id, prior)
+    print(f"Trusted-clicked {selector} via AX name {state_holder['label']!r}")
+
+
+def cmd_download(selector_or_url, to=None, timeout=60):
+    """Trigger a download via a real user-gesture click, then capture
+    the resulting file from Safari's downloads folder and move it to
+    `--to`.
+
+    Two forms:
+      pw download SELECTOR --to PATH   click the element, capture file
+      pw download URL --to PATH        navigate the tab to URL, then capture
+
+    The URL form is only useful when the URL itself causes Safari to
+    download (Content-Disposition response) AND the origin already has
+    download permission granted in Safari > Settings > Websites. The
+    SELECTOR form is more reliable — it's what you want for any normal
+    "click Download button" workflow.
+
+    Requires PW_ALLOW_FOREGROUND=1 (the pw window is briefly raised so
+    the trusted click actually lands on it).
+    """
+    is_url = selector_or_url.startswith(("http://", "https://", "file://"))
+
+    download_dir = _safari_downloads_dir()
+    if not os.path.isdir(download_dir):
+        raise PwError(f"Safari downloads folder does not exist: {download_dir}")
+    before = _snapshot_downloads(download_dir)
+
+    if is_url:
+        # URL form: just nav and watch the folder. Safari will download
+        # automatically if the response says so AND the origin is pre-allowed.
+        def do(browser, ctx, page):
+            page.goto(selector_or_url, wait_until="domcontentloaded", timeout=15000)
+        try:
+            connect_and_run(do)
+        except PwError:
+            pass  # nav often "fails" because Safari aborted to download
+    else:
+        # Selector form: trusted-click the element.
+        cmd_trusted_click(selector_or_url)
+
+    new_path = _wait_for_new_download(download_dir, before, timeout=timeout)
+    if not new_path:
+        raise PwError(
+            f"No new file appeared in {download_dir} within {timeout}s.\n"
+            "If this is the first download from this origin, Safari may "
+            "have shown a 'Do you want to allow downloads on X?' sheet "
+            "that we couldn't auto-accept — grant permission once via "
+            "Safari > Settings > Websites > Downloads, then retry."
+        )
+
+    if to:
+        to_abs = os.path.abspath(os.path.expanduser(to))
+        parent = os.path.dirname(to_abs)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        os.replace(new_path, to_abs)
+        print(to_abs)
+    else:
+        print(new_path)
+
+
+class _HrefParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        attrs = dict(attrs)
+        href = attrs.get("href")
+        if href:
+            self.hrefs.append(href)
+
+
+def _importinfo_links(index_html):
+    path = os.path.abspath(os.path.expanduser(index_html))
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            html = f.read()
+    except OSError as e:
+        raise PwError(f"Could not read index HTML: {e}")
+    parser = _HrefParser()
+    parser.feed(html)
+    base = "file://" + urllib.parse.quote(path)
+    links = []
+    for href in parser.hrefs:
+        url = urllib.parse.urljoin(base, href)
+        parsed = urllib.parse.urlparse(url)
+        if parsed.netloc.endswith("importinfo.com") and parsed.path.startswith("/search"):
+            links.append(url)
+    if not links:
+        raise PwError(f"No importinfo search links found in {index_html}")
+    return links
+
+
+def _slug_part(value):
+    chars = []
+    for ch in urllib.parse.unquote_plus(value).lower():
+        if ch.isalnum():
+            chars.append(ch)
+        elif chars and chars[-1] != "_":
+            chars.append("_")
+    return "".join(chars).strip("_") or "value"
+
+
+def _importinfo_filename(url):
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    for key in ("commodity", "shipper", "consignee", "product", "q"):
+        val = (qs.get(key) or [""])[0]
+        if val:
+            return f"{key}_{_slug_part(val)}.csv"
+    return f"importinfo_{abs(hash(url))}.csv"
+
+
+def cmd_importinfo_export(index_html, to_dir, limit=None, only=None,
+                          max_rows=50000, timeout=900):
+    """Export importinfo search-result CSVs from an HTML index of search links.
+
+    For each link in the index file:
+      1. Navigate Safari to the search URL.
+      2. Synthetic-click the "Download" span (opens the modal — no
+         user-gesture required for modal open).
+      3. Fill #export_limit_input with `max_rows` (formatted with the
+         site's expected thousands separator).
+      4. Verify #export_file_input is "csv".
+      5. Trusted-click "Confirm Download" — this initiates the actual
+         download, which requires a real OS-level user gesture.
+      6. Capture the new file from ~/Downloads and rename to
+         {to_dir}/{slug}.csv where slug is derived from the search query.
+
+    Requires PW_ALLOW_FOREGROUND=1 (each download briefly raises Safari).
+    """
+    links = _importinfo_links(index_html)
+    if only is not None:
+        if only < 1 or only > len(links):
+            raise PwError(f"--only must be 1..{len(links)}, got {only}")
+        selected = [(only, links[only - 1])]
+    else:
+        selected = list(enumerate(links, start=1))
+        if limit is not None:
+            selected = selected[:limit]
+
+    out_dir = os.path.abspath(os.path.expanduser(to_dir))
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ImportInfo's max-rows input pre-fills with a comma-formatted number
+    # ("1,000"). It accepts both formatted and bare integers, but we match
+    # the site's convention to minimize surprise if anything ever validates
+    # the rendered string.
+    max_rows_formatted = f"{int(max_rows):,}"
+
+    for idx, url in selected:
+        filename = _importinfo_filename(url)
+        dest = os.path.join(out_dir, filename)
+        print(f"[{idx}/{len(links)}] {url} -> {dest}", flush=True)
+
+        def open_modal(browser, ctx, page):
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # The Download "link near the search header" is actually a
+            # <span class="btn btn-primary"> with data-bs-toggle="modal".
+            # Synthetic click works for opening the modal (no
+            # user-gesture required), but the text= selector matches
+            # multiple things on the page — anchor to the span explicitly.
+            page.click("span.btn.btn-primary[data-bs-target='#downloadDetailsModal']",
+                       timeout=15000)
+            page.wait_for_selector("#export_limit_input", timeout=10000)
+            # Clear and set the limit. The default value is "1,000".
+            page.fill("#export_limit_input", max_rows_formatted, timeout=5000)
+            # Make sure CSV is selected.
+            page.select_option("#export_file_input", "csv", timeout=5000)
+
+        connect_and_run(open_modal)
+        cmd_download("text=Confirm Download", to=dest, timeout=timeout)
+
+
 def cmd_close():
     safari_close()
 
@@ -2842,6 +3418,103 @@ def _ng_set_handler(args):
     if len(args) < 2:
         raise PwError("Usage: pw ng-set SELECTOR VALUE")
     cmd_ng_set(args[0], args[1])
+
+
+def _trusted_click_handler(args):
+    no_dismiss = "--no-dismiss-sheets" in args
+    clean = [a for a in args if a != "--no-dismiss-sheets"]
+    if not clean:
+        raise PwError("Usage: pw trusted-click SELECTOR [--no-dismiss-sheets]")
+    cmd_trusted_click(clean[0], dismiss_sheets=not no_dismiss)
+
+
+def _download_handler(args):
+    to = None
+    timeout = 60
+    clean = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--to":
+            if i + 1 >= len(args):
+                raise PwError("--to requires a path")
+            to = args[i + 1]
+            i += 2
+            continue
+        if args[i] == "--timeout":
+            if i + 1 >= len(args):
+                raise PwError("--timeout requires seconds")
+            try:
+                timeout = int(args[i + 1])
+            except ValueError:
+                raise PwError(f"--timeout: not an integer: {args[i + 1]!r}")
+            i += 2
+            continue
+        clean.append(args[i])
+        i += 1
+    if not clean:
+        raise PwError("Usage: pw download SELECTOR_OR_URL [--to PATH] [--timeout SECONDS]")
+    cmd_download(clean[0], to=to, timeout=timeout)
+
+
+def _importinfo_export_handler(args):
+    to_dir = None
+    limit = None
+    only = None
+    max_rows = 50000
+    timeout = 900
+    clean = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--to":
+            if i + 1 >= len(args):
+                raise PwError("--to requires a directory")
+            to_dir = args[i + 1]
+            i += 2
+            continue
+        if args[i] == "--limit":
+            if i + 1 >= len(args):
+                raise PwError("--limit requires a number")
+            try:
+                limit = int(args[i + 1])
+            except ValueError:
+                raise PwError(f"--limit: not an integer: {args[i + 1]!r}")
+            i += 2
+            continue
+        if args[i] == "--only":
+            if i + 1 >= len(args):
+                raise PwError("--only requires a 1-indexed link number")
+            try:
+                only = int(args[i + 1])
+            except ValueError:
+                raise PwError(f"--only: not an integer: {args[i + 1]!r}")
+            i += 2
+            continue
+        if args[i] == "--max-rows":
+            if i + 1 >= len(args):
+                raise PwError("--max-rows requires a number")
+            try:
+                max_rows = int(args[i + 1])
+            except ValueError:
+                raise PwError(f"--max-rows: not an integer: {args[i + 1]!r}")
+            i += 2
+            continue
+        if args[i] == "--timeout":
+            if i + 1 >= len(args):
+                raise PwError("--timeout requires seconds")
+            try:
+                timeout = int(args[i + 1])
+            except ValueError:
+                raise PwError(f"--timeout: not an integer: {args[i + 1]!r}")
+            i += 2
+            continue
+        clean.append(args[i])
+        i += 1
+    if len(clean) != 1 or not to_dir:
+        raise PwError("Usage: pw importinfo-export INDEX_HTML --to DIR [--limit N|--only N] [--max-rows N] [--timeout SECONDS]")
+    if limit is not None and limit < 1:
+        raise PwError("--limit must be >= 1")
+    cmd_importinfo_export(clean[0], to_dir, limit=limit, only=only,
+                          max_rows=max_rows, timeout=timeout)
 
 
 def _back_handler(args):
@@ -3057,6 +3730,9 @@ COMMANDS = {
     "doctor":     {"handler": lambda args: cmd_doctor(),               "min_args": 0},
     "batch":      {"handler": lambda args: cmd_batch(args),            "min_args": 1, "usage": "pw batch \"CMD1\" \"CMD2\" ..."},
     "dismiss":    {"handler": lambda args: cmd_dismiss(),              "min_args": 0},
+    "trusted-click": {"handler": _trusted_click_handler,               "min_args": 1, "usage": "pw trusted-click SELECTOR [--no-dismiss-sheets]"},
+    "download":   {"handler": _download_handler,                       "min_args": 1, "usage": "pw download SELECTOR_OR_URL [--to PATH] [--timeout SECONDS]"},
+    "importinfo-export": {"handler": _importinfo_export_handler,        "min_args": 1, "usage": "pw importinfo-export INDEX_HTML --to DIR [--limit N|--only N]"},
 }
 
 

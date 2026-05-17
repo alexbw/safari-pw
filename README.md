@@ -112,6 +112,7 @@ pw close                # close pw's tracked tab (or scrub state)
 pw status               # is Safari running?
 pw doctor               # check setup
 pw batch "CMD1" "CMD2" ...   # run multiple commands in one connection (faster)
+pw download "#export" --to /tmp/export.csv
 ```
 
 Run `pw` with no arguments for the full reference.
@@ -158,6 +159,18 @@ pw ng-click "#submitBtn"                # → angular.element(el).triggerHandler
 ```
 
 Both go through `$scope.$apply()`, so watchers fire and form state (`$valid`, `$touched`, etc.) updates the same way it does for a real keystroke or click.
+
+### Downloading from authenticated sessions
+
+Safari treats downloads as a real user-gesture path. `pw download` and `pw trusted-click` use the Accessibility API's `AXPress` action instead of CGEvent mouse synthesis, because CGEvent clicks can produce `isTrusted=true` DOM events while Safari still drops the download default action.
+
+```bash
+helpers/safari-trusted-click/build.sh
+
+PW_ALLOW_FOREGROUND=1 pw download "#download" --to /tmp/report.csv
+```
+
+The helper requires Accessibility permission for the terminal or agent process that launches `pw`: System Settings → Privacy & Security → Accessibility. `PW_ALLOW_FOREGROUND=1` is required because native hit-testing only works against the frontmost Safari window; `pw` briefly raises its own managed window, performs `AXPress`, then restores focus.
 
 ### Talking to Safari is slow — batch when you can
 

@@ -62,6 +62,10 @@ Safari setup (one-time):
     1. Safari > Settings > Advanced > check "Show features for web developers"
     2. Safari > Settings > Developer > check "Allow JavaScript from Apple Events"
     3. First run: approve "Terminal wants to control Safari" dialog
+    4. For `pw download`: Safari > Settings > Websites > Downloads >
+       set "When visiting other websites" to "Allow". Otherwise the
+       first download from each origin shows a sheet pw can't dismiss
+       from a buried window.
 
 Note: react-click and react-set find React fiber internals on DOM elements
 and invoke component handlers directly, bypassing the DOM event system.
@@ -2837,14 +2841,81 @@ def _wait_for_new_download(d, before, timeout=60, poll=0.3):
     stops changing across two consecutive polls. `.download` packages
     (Safari's in-progress marker) are ignored — we wait for the rename
     to the final filename. Returns the path, or None on timeout."""
+    path, _ = _wait_for_download_or_blocking_sheet(
+        d, before, timeout=timeout, file_poll=poll, sheet_detect=False
+    )
+    return path
+
+
+# Sheet button labels we recognize as "this is a download-blocking sheet."
+# Other sheets (e.g. JS confirm() dialogs, form-resubmit prompts) are not
+# our concern — we only fail-fast when we're sure the sheet is what's
+# stopping the download from starting.
+_DOWNLOAD_BLOCKING_SHEET_LABELS = {"allow", "allow once", "download", "save"}
+
+
+def _detect_safari_blocking_sheet():
+    """Return a list of button labels for any Safari sheet that's blocking
+    a download, or None if no such sheet is up.
+
+    Iterates ALL Safari process windows (not just AXStandardWindow),
+    because pw's window is buried off-screen and may not match the usual
+    subrole filter. Cheap — one AppleScript round-trip, ~50-150ms."""
+    script = (
+        'tell application "System Events"\n'
+        '  tell process "Safari"\n'
+        '    try\n'
+        '      repeat with w in windows\n'
+        '        try\n'
+        '          if (count of sheets of w) > 0 then\n'
+        '            set btnNames to {}\n'
+        '            repeat with b in buttons of sheet 1 of w\n'
+        '              try\n'
+        '                set end of btnNames to name of b\n'
+        '              end try\n'
+        '            end repeat\n'
+        '            set AppleScript\'s text item delimiters to linefeed\n'
+        '            return btnNames as text\n'
+        '          end if\n'
+        '        end try\n'
+        '      end repeat\n'
+        '    end try\n'
+        '  end tell\n'
+        'end tell\n'
+        'return ""'
+    )
+    proc = _osascript(script, timeout=2)
+    if not proc or not proc.stdout:
+        return None
+    raw = proc.stdout.decode("utf-8", "replace").strip()
+    if not raw:
+        return None
+    buttons = [line.strip() for line in raw.splitlines() if line.strip()]
+    lowered = {b.lower() for b in buttons}
+    if lowered & _DOWNLOAD_BLOCKING_SHEET_LABELS:
+        return buttons
+    return None
+
+
+def _wait_for_download_or_blocking_sheet(
+    d, before, timeout=60, file_poll=0.3, sheet_check_every=1.5,
+    sheet_detect=True,
+):
+    """Race a file-watcher on `d` against a Safari-sheet detector. Returns
+    (path, sheet_buttons): exactly one is non-None on detection, both
+    None on full timeout. Sheet detection is suppressed while a
+    `.download` package is in flight — that's a confirmation prompt
+    appearing after a started download, not a blocker."""
     deadline = time.time() + timeout
     seen_size = {}
+    next_sheet_check = time.time() + 0.5  # let the click settle first
     while time.time() < deadline:
-        time.sleep(poll)
+        time.sleep(file_poll)
         try:
             entries = os.listdir(d)
         except OSError:
-            continue
+            entries = []
+        in_progress = any(n.endswith(".download") for n in entries)
         candidates = []
         for name in entries:
             if name.endswith(".download"):
@@ -2864,9 +2935,28 @@ def _wait_for_new_download(d, before, timeout=60, poll=0.3):
             except OSError:
                 continue
             if seen_size.get(path) == size and size > 0:
-                return path
+                return path, None
             seen_size[path] = size
-    return None
+        if sheet_detect and not in_progress and time.time() >= next_sheet_check:
+            buttons = _detect_safari_blocking_sheet()
+            if buttons:
+                return None, buttons
+            next_sheet_check = time.time() + sheet_check_every
+    return None, None
+
+
+def _origin_from_url(url):
+    """Return scheme://host[:port] for an http(s) URL, or '' if we can't
+    parse it. Used to name the offending origin in download errors."""
+    if not url:
+        return ""
+    try:
+        p = urllib.parse.urlsplit(url)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    except (ValueError, AttributeError):
+        pass
+    return ""
 
 
 def _safari_raise_pw_window(window_id, session_id=None):
@@ -3206,6 +3296,19 @@ def cmd_download(selector_or_url, to=None, timeout=60):
         raise PwError(f"Safari downloads folder does not exist: {download_dir}")
     before = _snapshot_downloads(download_dir)
 
+    # Grab the current page URL before the click so we can name the
+    # offending origin in the error message if the download stalls on a
+    # permission sheet. Cheap enough to do unconditionally.
+    origin = ""
+    try:
+        url_holder = {}
+        def grab_url(browser, ctx, page):
+            url_holder["url"] = page.url
+        connect_and_run(grab_url)
+        origin = _origin_from_url(url_holder.get("url") or "")
+    except PwError:
+        pass
+
     if is_url:
         # URL form: just nav and watch the folder. Safari will download
         # automatically if the response says so AND the origin is pre-allowed.
@@ -3215,18 +3318,33 @@ def cmd_download(selector_or_url, to=None, timeout=60):
             connect_and_run(do)
         except PwError:
             pass  # nav often "fails" because Safari aborted to download
+        if not origin:
+            origin = _origin_from_url(selector_or_url)
     else:
         # Selector form: trusted-click the element.
         cmd_trusted_click(selector_or_url)
 
-    new_path = _wait_for_new_download(download_dir, before, timeout=timeout)
+    new_path, sheet_buttons = _wait_for_download_or_blocking_sheet(
+        download_dir, before, timeout=timeout
+    )
+    if not new_path and sheet_buttons:
+        where = f" on {origin}" if origin else ""
+        raise PwError(
+            f"Safari is blocking the download{where} with a permission "
+            f"sheet (buttons: {', '.join(sheet_buttons)}). pw cannot "
+            "dismiss it from a buried window.\n\n"
+            "First-time fix: Safari > Settings > Websites > Downloads. "
+            "Either set the origin to 'Allow' explicitly, or set 'When "
+            "visiting other websites' to 'Allow' to grant globally. "
+            "Then retry."
+        )
     if not new_path:
         raise PwError(
-            f"No new file appeared in {download_dir} within {timeout}s.\n"
-            "If this is the first download from this origin, Safari may "
-            "have shown a 'Do you want to allow downloads on X?' sheet "
-            "that we couldn't auto-accept — grant permission once via "
-            "Safari > Settings > Websites > Downloads, then retry."
+            f"No new file appeared in {download_dir} within {timeout}s "
+            "and no blocking sheet was detected. The click may not have "
+            "reached a download-triggering element, or the server "
+            "returned an error. Re-run with --timeout to extend the "
+            "wait, or check the page state."
         )
 
     if to:

@@ -172,6 +172,14 @@ PW_ALLOW_FOREGROUND=1 pw download "#download" --to /tmp/report.csv
 
 The helper requires Accessibility permission for the terminal or agent process that launches `pw`: System Settings → Privacy & Security → Accessibility. `PW_ALLOW_FOREGROUND=1` is required because native hit-testing only works against the frontmost Safari window; `pw` briefly raises its own managed window, performs `AXPress`, then restores focus.
 
+**First-time download setup (do this once, before any batch download).** Safari shows a per-origin *"Do you want to allow downloads on X?"* sheet the first time it downloads from a site. That sheet is attached to the pw-managed window, which lives off-screen — pw can't reach it once the window is buried, so a 60-download batch will time out 60 times waiting for a sheet you can't see.
+
+**For full automation, allow downloads from all websites:** Safari → Settings → Websites → Downloads → set **"When visiting other websites"** to **Allow**. This is what you want for batch scraping. The per-origin allowlist becomes a one-by-one chore at scale.
+
+If you'd rather grant per-origin: load the page in your normal Safari (not pw's hidden window), trigger one download, click "Allow" on the sheet, then run pw. Safari remembers the choice for that origin.
+
+If pw detects the blocking sheet during a download wait, it fails fast with an error naming the origin instead of stalling on the timeout.
+
 ### Talking to Safari is slow — batch when you can
 
 Each `pw` invocation pays a ~50-150 ms round-trip for `osascript`. If you're chaining several actions, `batch` runs them in one connection:

@@ -144,6 +144,79 @@ class TestPwError:
         assert str(e) == "test message"
 
 
+class TestOriginFromUrl:
+    def test_https(self):
+        assert pw._origin_from_url("https://example.com/a/b?c=1") == "https://example.com"
+
+    def test_https_with_port(self):
+        assert pw._origin_from_url("https://example.com:8443/x") == "https://example.com:8443"
+
+    def test_http(self):
+        assert pw._origin_from_url("http://localhost/x") == "http://localhost"
+
+    def test_file_url_has_no_origin(self):
+        assert pw._origin_from_url("file:///tmp/x.html") == ""
+
+    def test_empty(self):
+        assert pw._origin_from_url("") == ""
+        assert pw._origin_from_url(None) == ""
+
+    def test_garbage_does_not_raise(self):
+        assert pw._origin_from_url("not a url") == ""
+
+
+class TestDownloadWait:
+    """Test _wait_for_download_or_blocking_sheet without Safari."""
+
+    def test_returns_none_on_timeout_when_no_sheet_detected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pw, "_detect_safari_blocking_sheet", lambda: None)
+        before = pw._snapshot_downloads(str(tmp_path))
+        path, buttons = pw._wait_for_download_or_blocking_sheet(
+            str(tmp_path), before, timeout=0.5, file_poll=0.05,
+        )
+        assert path is None and buttons is None
+
+    def test_returns_sheet_buttons_when_detected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            pw, "_detect_safari_blocking_sheet",
+            lambda: ["Allow", "Don't Allow"],
+        )
+        before = pw._snapshot_downloads(str(tmp_path))
+        path, buttons = pw._wait_for_download_or_blocking_sheet(
+            str(tmp_path), before, timeout=5, file_poll=0.05,
+            sheet_check_every=0.05,
+        )
+        assert path is None
+        assert buttons == ["Allow", "Don't Allow"]
+
+    def test_sheet_detection_suppressed_while_in_progress(self, tmp_path, monkeypatch):
+        # Drop an in-progress .download package — even if a sheet is up,
+        # we shouldn't fail-fast (sheet is post-start confirmation, not a
+        # blocker).
+        (tmp_path / "report.csv.download").mkdir()
+        monkeypatch.setattr(
+            pw, "_detect_safari_blocking_sheet",
+            lambda: ["Save", "Cancel"],
+        )
+        before = {}
+        path, buttons = pw._wait_for_download_or_blocking_sheet(
+            str(tmp_path), before, timeout=0.5, file_poll=0.05,
+            sheet_check_every=0.05,
+        )
+        assert path is None and buttons is None
+
+    def test_returns_path_when_file_appears(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pw, "_detect_safari_blocking_sheet", lambda: None)
+        before = {}
+        target = tmp_path / "report.csv"
+        target.write_text("payload")
+        path, buttons = pw._wait_for_download_or_blocking_sheet(
+            str(tmp_path), before, timeout=2, file_poll=0.05,
+        )
+        assert path == str(target)
+        assert buttons is None
+
+
 # ============================================================================
 # CLI DISPATCH TESTS — subprocess, no browser
 # ============================================================================

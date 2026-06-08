@@ -1,0 +1,7 @@
+interface:
+  display_name: "Safari pw"
+  short_description: "Automate the user's real Safari browser"
+  default_prompt: "Use $pw to browse or automate a website through my real Safari session."
+
+policy:
+  allow_implicit_invocation: true

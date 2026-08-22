@@ -15,23 +15,26 @@ The command should already be on `PATH` as `pw`. If it is missing, check `/Users
 
 - Run `pw doctor` if Safari automation fails or permissions are unknown.
 - Run `pw` with no arguments for the full command reference.
-- Prefer named sessions for agent work: add `--name codex` or set `PW_SESSION=codex` so other sessions are not disturbed.
+- Every agent task must use its own named session, such as `--name codex-parking-20260822-0915`. Do not reuse a generic shared session when tasks may overlap.
+- At the start of a task, run `pw cleanup --stale-hours 12` to collect sessions left by interrupted work.
 
 ## Common Commands
 
 ```bash
-pw nav URL --name codex
-pw snap --name codex
-pw text [SELECTOR] --name codex
-pw links [SELECTOR] --name codex
-pw html [SELECTOR] --name codex
-pw click SELECTOR --name codex
-pw fill SELECTOR TEXT --name codex
-pw press Enter --name codex
-pw screenshot /tmp/pw-screenshot.png --name codex
-pw wait SELECTOR --name codex
-pw back --name codex
-pw close --name codex
+pw cleanup --stale-hours 12
+pw nav URL --name codex-task-20260822-0915
+pw snap --name codex-task-20260822-0915
+pw text [SELECTOR] --name codex-task-20260822-0915
+pw links [SELECTOR] --name codex-task-20260822-0915
+pw html [SELECTOR] --name codex-task-20260822-0915
+pw click SELECTOR --name codex-task-20260822-0915
+pw fill SELECTOR TEXT --name codex-task-20260822-0915
+pw press Enter --name codex-task-20260822-0915
+pw screenshot /tmp/pw-screenshot.png --name codex-task-20260822-0915
+pw wait SELECTOR --name codex-task-20260822-0915
+pw back --name codex-task-20260822-0915
+pw close --name codex-task-20260822-0915
+pw close --all
 ```
 
 Selectors can be CSS selectors or `text=...` for visible text.
@@ -49,7 +52,10 @@ pw batch --name codex "nav https://example.com" "click 'text=Sign in'" "snap"
 3. Use `pw links --name codex` when choosing navigation targets.
 4. Use `pw screenshot PATH --name codex` only when visual layout matters; inspect the image with the local image viewer if needed.
 5. Use `pw wait SELECTOR --name codex` after actions that trigger async page updates.
-6. Use `pw close --name codex` when done with a managed tab unless preserving state is useful.
+6. **Mandatory cleanup:** before sending the final response, run `pw close --name SESSION` on success, failure, timeout, or a blocked workflow. Treat it like a `finally` block. Do not preserve a browser session unless the user explicitly asks; authenticated cookies remain in Safari without keeping the task window open.
+7. Verify cleanup with `pw tabs --name SESSION`; it must report `No tabs for current pw session.` If close fails, retry once and report the cleanup failure rather than silently leaving a window behind.
+
+`pw close --all` closes every pw-owned window and scrubs all pw state. Use it only for an intentional global reset after confirming no other automation task is active; never use it as routine per-task cleanup.
 
 ## Framework-Specific Commands
 

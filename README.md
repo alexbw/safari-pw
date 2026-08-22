@@ -108,7 +108,9 @@ pw wait SEL             # wait up to 10s for a selector to appear
 pw tabs                 # list open tabs
 pw tab N                # switch to tab N
 pw back                 # go back
-pw close                # close pw's tracked tab (or scrub state)
+pw close                # close the current pw session (or scrub state if unnamed)
+pw close --all          # scrub all pw state and close pw-owned windows
+pw cleanup --stale-hours 12  # close sessions abandoned by interrupted tasks
 pw status               # is Safari running?
 pw doctor               # check setup
 pw batch "CMD1" "CMD2" ...   # run multiple commands in one connection (faster)
@@ -129,16 +131,19 @@ pw nav example.com --html "main"        # print HTML of <main>
 
 ### Multi-agent / multi-tab sessions
 
-Each `--name` tracks its own tab independently. Use this when running multiple agents or scripts that shouldn't fight over the same tab:
+Each `--name` owns a dedicated Safari window. Use a unique name for every agent task so concurrent work cannot fight over a tab, and close it in a `finally` path:
 
 ```bash
-pw nav https://site-a.com --name alice
-pw nav https://site-b.com --name bob
-pw click "#submit" --name alice         # targets site-a tab
-pw fill "#input" "hi" --name bob        # targets site-b tab
+pw cleanup --stale-hours 12
+pw nav https://site-a.com --name codex-site-a-20260822-0915
+pw click "#submit" --name codex-site-a-20260822-0915
+pw close --name codex-site-a-20260822-0915
+pw tabs --name codex-site-a-20260822-0915  # No tabs for current pw session.
 ```
 
-You can also set `PW_SESSION=alice` in the environment.
+`close` verifies that the session window no longer has tabs and removes its state only after that postcondition passes. If cleanup leaves no user or concurrent-session tabs, `pw` quits the otherwise-empty Safari process to clear Safari's invisible zero-tab window objects. `pw close --all` is an intentional global reset; do not use it for ordinary per-task cleanup.
+
+You can also set `PW_SESSION` in the environment.
 
 ### React / MUI sites
 

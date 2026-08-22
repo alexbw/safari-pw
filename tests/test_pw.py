@@ -324,7 +324,7 @@ class TestCommandsDict:
             "launch", "nav", "click", "fill", "type", "press", "select",
             "screenshot", "snap", "text", "html", "eval", "title", "url",
             "links", "wait", "tabs", "tab", "back", "close", "status",
-            "doctor", "batch",
+            "cleanup", "doctor", "batch",
         }
         missing = required - set(pw.COMMANDS.keys())
         assert not missing, f"required commands missing: {missing}"
@@ -526,6 +526,123 @@ class TestSessionFiles:
         """--name without a session name should error."""
         code, out, err = run_pw("--name")
         assert code == 1
+
+    def test_state_write_records_cleanup_lease(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pw, "STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(pw, "_session_name", "codex-cleanup-test")
+        monkeypatch.setattr(pw.time, "time", lambda: 1234.0)
+
+        pw._write_tab_state({"session_id": "pw_named_codex-cleanup-test"})
+
+        state = json.loads(
+            (tmp_path / "session-codex-cleanup-test.json").read_text()
+        )
+        assert state["session_name"] == "codex-cleanup-test"
+        assert state["created_at"] == 1234.0
+        assert state["last_used_at"] == 1234.0
+
+    def test_named_close_uses_state_and_marker_then_removes_state(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "session-codex-close-test.json"
+        path.write_text(json.dumps({"window_id": 41, "session_id": "old"}))
+        closed = []
+        monkeypatch.setattr(pw, "STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(pw, "_find_session_window_ids", lambda _name: [42])
+        monkeypatch.setattr(pw, "_close_pw_window", closed.append)
+        monkeypatch.setattr(pw, "_pw_window_has_tabs", lambda _wid: False)
+
+        count = pw._close_named_session("codex-close-test")
+
+        assert count == 2
+        assert closed == [41, 42]
+        assert not path.exists()
+
+    def test_named_close_preserves_state_when_window_close_fails(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "session-codex-close-fail.json"
+        path.write_text(json.dumps({"window_id": 51}))
+        monkeypatch.setattr(pw, "STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(pw, "_find_session_window_ids", lambda _name: [])
+
+        def fail(_window_id):
+            raise pw.PwError("Safari refused close")
+
+        monkeypatch.setattr(pw, "_close_pw_window", fail)
+
+        with pytest.raises(pw.PwError, match="Safari refused close"):
+            pw._close_named_session("codex-close-fail")
+        assert path.exists(), "ownership state must survive a failed cleanup"
+
+    def test_stale_cleanup_excludes_current_and_fresh_sessions(
+        self, tmp_path, monkeypatch
+    ):
+        stale = tmp_path / "session-codex-stale.json"
+        current = tmp_path / "session-codex-current.json"
+        fresh = tmp_path / "session-codex-fresh.json"
+        for path in (stale, current, fresh):
+            path.write_text("{}")
+        os.utime(stale, (100, 100))
+        os.utime(current, (100, 100))
+        os.utime(fresh, (950, 950))
+        monkeypatch.setattr(pw, "STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(pw, "_session_name", "codex-current")
+        monkeypatch.setattr(pw.time, "time", lambda: 1000.0)
+        closed = []
+
+        def close(name, path=None):
+            closed.append((name, path))
+            return 1
+
+        monkeypatch.setattr(pw, "_close_named_session", close)
+
+        count = pw.cleanup_stale_sessions(0.1)
+
+        assert count == 1
+        assert closed == [("codex-stale", str(stale))]
+
+    def test_tabs_is_passive_after_named_session_close(self, monkeypatch, capsys):
+        monkeypatch.setattr(pw, "_session_name", "codex-closed")
+        monkeypatch.setattr(pw, "_read_tab_state", lambda: None)
+        monkeypatch.setattr(
+            pw,
+            "_jxa",
+            lambda *_args, **_kwargs: pytest.fail("tabs must not inspect user windows"),
+        )
+
+        pw.cmd_tabs()
+
+        assert capsys.readouterr().out.strip() == "No tabs for current pw session."
+
+    def test_empty_safari_quits_to_clear_phantom_windows(self, monkeypatch):
+        commands = []
+        monkeypatch.setattr(pw, "_jxa", lambda *_args, **_kwargs: "0")
+        monkeypatch.setattr(pw, "_osascript", commands.append)
+
+        pw._quit_safari_if_no_visible_windows()
+
+        assert commands == ['tell application "Safari" to quit']
+
+    def test_user_or_concurrent_tabs_keep_safari_running(self, monkeypatch):
+        monkeypatch.setattr(pw, "_jxa", lambda *_args, **_kwargs: "2")
+        monkeypatch.setattr(
+            pw,
+            "_osascript",
+            lambda _script: pytest.fail("must not quit Safari with live tabs"),
+        )
+
+        pw._quit_safari_if_no_visible_windows()
+
+    def test_close_all_requires_exact_flag(self, monkeypatch):
+        monkeypatch.setattr(
+            pw,
+            "safari_close_all",
+            lambda: pytest.fail("invalid close arguments must not reset all sessions"),
+        )
+
+        with pytest.raises(pw.PwError, match=r"pw close \[--all\]"):
+            pw.cmd_close(["all"])
 
 
 class TestSafariPageInit:
@@ -745,10 +862,11 @@ def safari_browser():
     for path in [REACT_FIXTURE_PATH, POINTER_FIXTURE_PATH]:
         if os.path.exists(path):
             os.unlink(path)
-    # Clean up any test session files
+    # Clean up any test sessions through pw so Safari windows close too.
     import glob as _glob
     for f in _glob.glob(os.path.join(pw.STATE_DIR, "session-test-*.json")):
-        os.unlink(f)
+        name = os.path.basename(f)[len("session-"):-len(".json")]
+        _run_safari("close", "--name", name)
 
 
 def _run_safari(*args, timeout=30):
@@ -941,24 +1059,8 @@ class TestEmptyTabRegression:
 
     @staticmethod
     def _close_session_tab(session_name):
-        """Close the managed tab for a session and remove its state file."""
-        path = os.path.join(pw.STATE_DIR, f"session-{session_name}.json")
-        try:
-            if os.path.exists(path):
-                state = json.loads(open(path).read())
-                w = state.get("window_index", 0)
-                t = state.get("tab_index", 0)
-                # Close by id() so we don't trip over reordering
-                subprocess.run(
-                    ["osascript", "-l", "JavaScript", "-e", f'''
-                    var s = Application("Safari");
-                    try {{ s.windows[{w}].tabs[{t}].close(); }} catch(e) {{}}
-                    '''],
-                    capture_output=True, timeout=5,
-                )
-        finally:
-            if os.path.exists(path):
-                os.unlink(path)
+        """Close the managed Safari window for a session."""
+        run_pw("--name", session_name, "close")
 
     def test_non_nav_first_command_does_not_spawn_extra_tabs(self, safari_browser):
         """The headline regression: four non-nav commands in a row with
@@ -993,6 +1095,65 @@ class TestEmptyTabRegression:
         finally:
             self._close_session_tab(name)
 
+    def test_first_nav_does_not_leave_companion_blank_tab(self, safari_browser):
+        """A new pw window should contain only the navigated session tab.
+        Pre-fix, Safari's initial tab remained next to the real pw tab."""
+        name = f"test-first-nav-no-blank-{int(time.time())}"
+        path = os.path.join(pw.STATE_DIR, f"session-{name}.json")
+        if os.path.exists(path):
+            os.unlink(path)
+        try:
+            code, _, err = run_pw(
+                "--name", name, "nav", f"file://{REACT_FIXTURE_PATH}", "--quiet"
+            )
+            assert code == 0, err
+            state = json.loads(open(path).read())
+            win_id = state["window_id"]
+            tab_count = pw._jxa(
+                f'var s = Application("Safari"); var n = -1; '
+                f'for (var i = 0; i < s.windows.length; i++) {{'
+                f'  try {{ if (s.windows[i].id() === {win_id}) {{ n = s.windows[i].tabs.length; break; }} }}'
+                f'  catch(e) {{}} }} n;'
+            )
+            assert int(tab_count) == 1, (
+                f"first nav left extra tabs in the pw window: {tab_count}"
+            )
+        finally:
+            self._close_session_tab(name)
+
+    def test_tabs_command_is_passive_for_missing_session(self, safari_browser):
+        """Listing tabs must not create a managed tab for a missing session."""
+        name = f"test-tabs-passive-{int(time.time())}"
+        path = os.path.join(pw.STATE_DIR, f"session-{name}.json")
+        if os.path.exists(path):
+            os.unlink(path)
+        managed_before = self._managed_tab_count()
+        code, _, err = run_pw("--name", name, "tabs")
+        assert code == 0, err
+        managed_after = self._managed_tab_count()
+        assert managed_after == managed_before
+        assert not os.path.exists(path)
+
+    def test_named_close_removes_real_url_window_and_state(self, safari_browser):
+        """Cleanup must close a navigated window, not only blank placeholders."""
+        name = f"test-close-real-url-{int(time.time())}"
+        path = os.path.join(pw.STATE_DIR, f"session-{name}.json")
+        code, _, err = run_pw(
+            "--name", name, "nav", f"file://{REACT_FIXTURE_PATH}", "--quiet"
+        )
+        assert code == 0, err
+        win_id = json.loads(open(path).read())["window_id"]
+
+        code, out, err = run_pw("--name", name, "close")
+
+        assert code == 0, err
+        assert "closed" in out.lower()
+        assert not os.path.exists(path)
+        assert not pw._pw_window_has_tabs(win_id)
+        code, out, err = run_pw("--name", name, "tabs")
+        assert code == 0, err
+        assert out.strip() == "No tabs for current pw session."
+
     def test_create_new_tab_marker_round_trip(self, safari_browser):
         """The new tab must have window.__pw_session_id set to the
         session_id returned by _safari_create_new_tab. Pre-fix, the
@@ -1003,6 +1164,19 @@ class TestEmptyTabRegression:
         present as soon as the page is loaded."""
         win, tab, sid, win_id = pw._safari_create_new_tab()
         try:
+            assert tab == 0, (
+                "fresh pw windows must claim Safari's initial tab instead "
+                "of pushing a second tab and leaving the first blank"
+            )
+            tab_count = pw._jxa(
+                f'var s = Application("Safari"); var n = -1; '
+                f'for (var i = 0; i < s.windows.length; i++) {{'
+                f'  try {{ if (s.windows[i].id() === {win_id}) {{ n = s.windows[i].tabs.length; break; }} }}'
+                f'  catch(e) {{}} }} n;'
+            )
+            assert int(tab_count) == 1, (
+                f"fresh pw window should contain exactly one tab; got {tab_count}"
+            )
             got = pw._jxa(
                 f'var s = Application("Safari"); '
                 f's.doJavaScript("window.__pw_session_id || \'NONE\'", '
@@ -1017,12 +1191,7 @@ class TestEmptyTabRegression:
         finally:
             # Clean up the managed tab + its dedicated pw window.
             try:
-                pw._jxa(
-                    f'var s = Application("Safari"); '
-                    f'for (var i = 0; i < s.windows.length; i++) {{'
-                    f'  try {{ if (s.windows[i].id() === {win_id}) {{ s.windows[i].close(); break; }} }}'
-                    f'  catch(e) {{}} }}'
-                )
+                pw._close_pw_window(win_id)
             except Exception:
                 pass
 
@@ -1042,12 +1211,7 @@ class TestEmptyTabRegression:
             assert got == my_sid, f"tab marker {got!r} != explicit sid {my_sid!r}"
         finally:
             try:
-                pw._jxa(
-                    f'var s = Application("Safari"); '
-                    f'for (var i = 0; i < s.windows.length; i++) {{'
-                    f'  try {{ if (s.windows[i].id() === {win_id}) {{ s.windows[i].close(); break; }} }}'
-                    f'  catch(e) {{}} }}'
-                )
+                pw._close_pw_window(win_id)
             except Exception:
                 pass
 
@@ -1956,9 +2120,13 @@ class TestCreateNewTab:
         assert callable(pw._safari_create_new_tab)
 
     def test_jxa_template(self):
-        """The JXA should push a new tab without switching to it."""
+        """New windows should reuse their initial tab; recovered windows
+        may still push a replacement tab."""
         import inspect
         source = inspect.getsource(pw._safari_create_new_tab)
+        assert "tabs.length > 0" in source
+        assert "created && win.tabs.length > 0" in source
+        assert "tabIdx = 0" in source
         assert "win.tabs.push" in source
         assert "win.tabs.length - 1" in source
 
@@ -2048,27 +2216,26 @@ class TestConcurrentBrowsingIntegration:
     """
 
     def test_named_session_creates_own_tab(self):
-        """pw nav with --name should create a new tab, not hijack current."""
-        # Count tabs before
-        code, out, err = run_pw("tabs")
-        before_lines = [l for l in out.strip().split("\n") if l.startswith("[")]
-        before_count = len(before_lines)
+        """pw nav with --name should create a new window, not hijack current."""
+        before_ids = set(json.loads(pw._jxa('''
+            var s = Application("Safari"), ids = [];
+            for (var i = 0; i < s.windows.length; i++) ids.push(s.windows[i].id());
+            JSON.stringify(ids);
+        ''')))
 
-        # Navigate with a named session
         session_name = f"test-concurrent-{int(time.time())}"
-        code, out, err = run_pw("--name", session_name, "nav", "file:///tmp/pw-test-fixture.html", "--quiet", timeout=60)
-        assert code == 0
-
-        # Count tabs after — should have one more
-        code, out, err = run_pw("tabs")
-        after_lines = [l for l in out.strip().split("\n") if l.startswith("[")]
-        after_count = len(after_lines)
-        assert after_count >= before_count + 1, f"Expected new tab: {before_count} -> {after_count}"
-
-        # Cleanup: close the session's tab by navigating away and clearing state
-        session_file = os.path.join(pw.STATE_DIR, f"session-{session_name}.json")
-        if os.path.exists(session_file):
-            os.unlink(session_file)
+        try:
+            code, out, err = run_pw(
+                "--name", session_name, "nav",
+                "file:///tmp/pw-test-fixture.html", "--quiet", timeout=60,
+            )
+            assert code == 0, err
+            state = json.loads(
+                open(os.path.join(pw.STATE_DIR, f"session-{session_name}.json")).read()
+            )
+            assert state["window_id"] not in before_ids
+        finally:
+            run_pw("--name", session_name, "close")
 
     def test_named_session_persists_across_commands(self):
         """Multiple commands with same --name should target the same tab."""
@@ -2083,10 +2250,7 @@ class TestConcurrentBrowsingIntegration:
         assert code == 0
         assert "PW Test Page" in out or "test" in out.lower()
 
-        # Cleanup
-        session_file = os.path.join(pw.STATE_DIR, f"session-{session_name}.json")
-        if os.path.exists(session_file):
-            os.unlink(session_file)
+        run_pw("--name", session_name, "close")
 
     def test_claude_code_env_auto_session(self):
         """CLAUDE_CODE=1 env should auto-create a session named 'claude'."""

@@ -27,7 +27,8 @@ Usage:
     pw tabs                           List open tabs
     pw tab INDEX                      Switch to tab by index
     pw back                           Navigate back
-    pw close                          Close the browser
+    pw close [--all]                  Close current session or scrub all pw state
+    pw cleanup [--stale-hours N]      Close expired pw sessions left by crashed tasks
     pw status                         Check if browser is running
     pw doctor                         Check Safari setup (permissions, settings)
     pw batch "CMD1" "CMD2" ...        Run multiple commands in one connection (faster)
@@ -131,6 +132,7 @@ TRUSTED_CLICK_BIN = os.path.join(
 # user navigated it away). We only reuse / hide windows whose id is in
 # this registry.
 PW_WINDOW_REGISTRY = os.path.join(STATE_DIR, "windows.json")
+PW_STALE_SESSION_HOURS = 12.0
 
 # --- Session management ---
 _session_name = None  # set by --name flag
@@ -1574,6 +1576,11 @@ def _safari_session_file():
     return SAFARI_TAB_FILE
 
 
+def _named_session_file(name):
+    """Return the state path for a validated named session."""
+    return os.path.join(STATE_DIR, f"session-{_safe_session_name(name)}.json")
+
+
 def _coerce_index(value, default=0):
     """Coerce a persisted index to a non-negative int. Indices flow into JXA
     via f-strings (safari.windows[N].tabs[N]); a tampered state file with a
@@ -1629,8 +1636,35 @@ def _read_tab_state():
 
 
 def _write_tab_state(state):
-    """Persist tab state for the current session."""
-    _safe_json_write(_safari_session_file(), state)
+    """Persist tab state and renew the session's crash-cleanup lease."""
+    path = _safari_session_file()
+    now = time.time()
+    existing = None
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                existing = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        existing = None
+    payload = dict(state)
+    payload["created_at"] = (
+        existing.get("created_at", now)
+        if isinstance(existing, dict)
+        else now
+    )
+    payload["last_used_at"] = now
+    if _session_name:
+        payload["session_name"] = _session_name
+    _safe_json_write(path, payload)
+
+
+def _touch_session_state():
+    """Renew a live named session without resolving or creating a Safari tab."""
+    if not _session_name:
+        return
+    state = _read_tab_state()
+    if state:
+        _write_tab_state(state)
 
 
 def _safari_tab_index():
@@ -1794,14 +1828,110 @@ def _close_pw_window(window_id):
     `safari.windows[]` afterwards — the sweep handles those.)"""
     if not window_id:
         return
-    _osascript(
-        f'tell application "Safari" to '
-        f'close (every window whose id is {int(window_id)})'
-    )
     wid_int = int(window_id)
+    last_error = None
+    for _ in range(2):
+        try:
+            _osascript(
+                f'tell application "Safari" to '
+                f'close (every window whose id is {wid_int})'
+            )
+        except Exception as exc:
+            last_error = exc
+        if not _pw_window_has_tabs(wid_int):
+            break
+        time.sleep(0.1)
+    if _pw_window_has_tabs(wid_int):
+        if last_error:
+            raise PwError(f"could not close pw Safari window {wid_int}: {last_error}")
+        raise PwError(f"could not close pw Safari window {wid_int}")
     def _drop(entries):
         entries.pop(wid_int, None)
     _registry_rmw(_drop)
+
+
+def _pw_window_has_tabs(window_id):
+    """Return whether a Safari window still exists with visible tab content."""
+    if not window_id:
+        return False
+    raw = _jxa(f'''
+    var safari = Application("Safari");
+    if (!safari.running()) {{ false; }}
+    else {{
+        var alive = false;
+        for (var w = 0; w < safari.windows.length; w++) {{
+            try {{
+                if (safari.windows[w].id() === {int(window_id)}) {{
+                    alive = safari.windows[w].tabs.length > 0;
+                    break;
+                }}
+            }} catch(e) {{}}
+        }}
+        alive;
+    }}
+    ''', timeout=5)
+    return str(raw).strip().lower() == "true"
+
+
+def _quit_safari_if_no_visible_windows():
+    """Quit Safari only when cleanup left no user or agent tabs behind.
+
+    Safari retains zero-tab phantom window objects after AppleScript close.
+    Quitting an otherwise empty Safari clears them; any real user window or
+    concurrent pw session prevents the quit.
+    """
+    try:
+        raw = _jxa('''
+        var safari = Application("Safari");
+        var tabs = 0;
+        if (safari.running()) {
+            for (var w = 0; w < safari.windows.length; w++) {
+                tabs += safari.windows[w].tabs.length;
+            }
+        }
+        String(tabs);
+        ''', timeout=5)
+        if int(str(raw).strip() or "0") == 0:
+            _osascript('tell application "Safari" to quit')
+    except (PwError, ValueError, OSError):
+        # Cleanup of the owned window already succeeded. App-level restoration
+        # is best effort and must never turn a clean session close into a retry.
+        return
+
+
+def _find_session_window_ids(session_name):
+    """Find windows carrying a named session marker when its state is stale."""
+    sid = f"pw_named_{_safe_session_name(session_name)}"
+    try:
+        raw = _jxa(f'''
+        var safari = Application("Safari");
+        var ids = [];
+        if (safari.running()) {{
+            for (var w = 0; w < safari.windows.length; w++) {{
+                var matched = false;
+                for (var t = 0; t < safari.windows[w].tabs.length; t++) {{
+                    try {{
+                        var sid = safari.doJavaScript(
+                            "window.__pw_session_id || ''",
+                            {{in: safari.windows[w].tabs[t]}}
+                        );
+                        if (sid === {json.dumps(sid)}) {{ matched = true; break; }}
+                    }} catch(e) {{}}
+                }}
+                if (matched) {{
+                    try {{ ids.push(safari.windows[w].id()); }} catch(e) {{}}
+                }}
+            }}
+        }}
+        JSON.stringify(ids);
+        ''', timeout=10)
+        values = json.loads(raw) if raw else []
+    except (PwError, json.JSONDecodeError):
+        return []
+    return [
+        int(value) for value in values
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    ]
 
 
 def _sweep_orphan_pw_windows(spare_window_id=None):
@@ -1939,7 +2069,12 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
     if (hintId !== null) {{
         for (var i = 0; i < safari.windows.length; i++) {{
             try {{
-                if (safari.windows[i].id() === hintId) {{ win = safari.windows[i]; break; }}
+                // Safari retains zero-tab phantom windows after AppleScript
+                // close. They cannot accept a new tab reliably, so never
+                // reuse one as a live session window.
+                if (safari.windows[i].id() === hintId && safari.windows[i].tabs.length > 0) {{
+                    win = safari.windows[i]; break;
+                }}
             }} catch(e) {{}}
         }}
     }}
@@ -1988,23 +2123,33 @@ def _safari_create_new_tab(session_id=None, existing_window_id=None):
     if locate.get("created"):
         _bury_pw_window(new_win_id)
 
-    # Phase 2: push a tab, navigate to the marker data: URL, wait for
-    # readyState. After the load we re-assert bury since Safari may
-    # surface a window when a new tab finishes loading.
+    # Phase 2: navigate a tab to the marker data: URL, wait for readyState.
+    # A freshly-created Safari window already has one tab; claim that tab
+    # instead of pushing a second one, otherwise every new pw window leaves
+    # behind a companion blank/start-page tab. When reusing an existing pw
+    # window for recovery, push a new tab so any current live session tab
+    # remains untouched.
+    created_js = "true" if locate.get("created") else "false"
     push_script = f'''
     var safari = Application("Safari");
     var targetId = {json.dumps(new_win_id)};
+    var created = {created_js};
     var win = null, winIdx = -1;
     for (var i = 0; i < safari.windows.length; i++) {{
         try {{ if (safari.windows[i].id() === targetId) {{ win = safari.windows[i]; winIdx = i; break; }} }} catch(e) {{}}
     }}
     if (!win) {{ throw new Error("pw window vanished between locate and push"); }}
 
-    // Push tab, then assign URL. Safari's JXA Tab() constructor doesn't
-    // accept {{url: ...}}; the URL must be set after push.
-    var newTab = safari.Tab();
-    win.tabs.push(newTab);
-    var tabIdx = win.tabs.length - 1;
+    var tabIdx = 0;
+    if (created && win.tabs.length > 0) {{
+        tabIdx = 0;
+    }} else {{
+        // Safari's JXA Tab() constructor doesn't accept {{url: ...}};
+        // the URL must be set after push.
+        var newTab = safari.Tab();
+        win.tabs.push(newTab);
+        tabIdx = win.tabs.length - 1;
+    }}
     win.tabs[tabIdx].url = {url_js};
 
     // Poll readyState so the tab is actually navigable when we return.
@@ -2215,28 +2360,19 @@ def safari_launch():
 
 
 def safari_close():
-    """Tear down this session's pw Safari window and remove its state file.
-
-    Per-session windows are not shared, so closing a session is a single
-    AppleScript `close window N` against the id recorded in state. We also
-    sweep any orphan windows still in the registry — windows from earlier
-    sessions that crashed without calling close — so they don't pile up.
-    """
+    """Tear down this session and prove its owned Safari window is gone."""
     if _session_name:
-        path = _safari_session_file()
-        state = _read_tab_state()
-        win_id = state.get("window_id") if state else None
-        if win_id:
-            _close_pw_window(int(win_id))
-        if os.path.exists(path):
-            os.unlink(path)
-        # Sweep any other registry-tracked orphans (windows from crashed
-        # sessions whose state file is gone but window still exists).
+        _close_named_session(_session_name)
         _sweep_orphan_pw_windows()
+        _quit_safari_if_no_visible_windows()
         print(f"Session {_session_name!r} closed.")
         return
 
-    # Unnamed: scrub all state files AND close any orphan pw windows.
+    safari_close_all()
+
+
+def safari_close_all():
+    """Close every state- or registry-owned pw window, then scrub state."""
     import glob as _glob
     paths = [SAFARI_TAB_FILE]
     paths += _glob.glob(os.path.join(STATE_DIR, "session-*.json"))
@@ -2244,16 +2380,88 @@ def safari_close():
     paths += _glob.glob("/tmp/pw-safari-session-*.json")
     if os.path.exists("/tmp/pw-safari-tab"):
         paths.append("/tmp/pw-safari-tab")
+    window_ids = set(_read_window_registry())
+    for path in paths:
+        state = _read_state_path(path)
+        if state and state.get("window_id"):
+            window_ids.add(int(state["window_id"]))
+    # Close before deleting ownership evidence. This also reaches windows
+    # whose registry entry was lost but whose session file survived.
+    for wid in sorted(window_ids):
+        _close_pw_window(wid)
     for path in paths:
         try:
             if os.path.exists(path):
                 os.unlink(path)
-        except OSError:
-            pass
-    # Close every window we know about. This is a full reset.
-    for wid in list(_read_window_registry()):
+        except OSError as exc:
+            raise PwError(f"could not remove pw state {path}: {exc}") from exc
+    _quit_safari_if_no_visible_windows()
+    print("Safari state cleaned.")
+
+
+def _read_state_path(path):
+    try:
+        with open(path) as f:
+            return _sanitize_state(json.load(f))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _close_named_session(session_name, path=None):
+    """Close one named session from state and marker evidence.
+
+    The marker lookup makes cleanup work even when the state file was lost or
+    partially written. State is removed only after every owned window passes
+    the close postcondition.
+    """
+    name = _safe_session_name(session_name)
+    path = path or _named_session_file(name)
+    state = _read_state_path(path)
+    window_ids = set(_find_session_window_ids(name))
+    if state and state.get("window_id"):
+        window_ids.add(int(state["window_id"]))
+    for wid in sorted(window_ids):
         _close_pw_window(wid)
-    print("Safari state cleaned. (Safari left running)")
+    remaining = [wid for wid in window_ids if _pw_window_has_tabs(wid)]
+    if remaining:
+        raise PwError(
+            f"session {name!r} cleanup incomplete; Safari windows remain: {remaining}"
+        )
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+    except OSError as exc:
+        raise PwError(f"could not remove session {name!r} state: {exc}") from exc
+    return len(window_ids)
+
+
+def cleanup_stale_sessions(stale_hours=PW_STALE_SESSION_HOURS, *, agent_only=False):
+    """Close expired named sessions left behind by interrupted tasks."""
+    import glob as _glob
+    try:
+        hours = float(stale_hours)
+    except (TypeError, ValueError) as exc:
+        raise PwError("--stale-hours must be a positive number") from exc
+    if hours <= 0:
+        raise PwError("--stale-hours must be a positive number")
+    cutoff = time.time() - hours * 3600
+    closed = 0
+    for path in sorted(_glob.glob(os.path.join(STATE_DIR, "session-*.json"))):
+        name = os.path.basename(path)[len("session-"):-len(".json")]
+        if not name or name == _session_name:
+            continue
+        if agent_only and not (
+            name == "claude" or name.startswith("claude-") or name.startswith("codex-")
+        ):
+            continue
+        try:
+            modified = os.path.getmtime(path)
+        except OSError:
+            continue
+        if modified > cutoff:
+            continue
+        closed += _close_named_session(name, path=path)
+    return closed
 
 
 def safari_status():
@@ -2757,13 +2965,71 @@ def cmd_wait(selector):
 
 
 def cmd_tabs():
-    def do(browser, ctx, page):
-        active_idx = page._tab if hasattr(page, '_tab') else -1
-        for i, p in enumerate(ctx.pages):
-            marker = " *" if (i == active_idx if active_idx >= 0 else p == page) else ""
-            print(f"[{i}] {p.title()} | {p.url}{marker}")
-
-    connect_and_run(do)
+    """List tabs without creating or recovering a pw session tab."""
+    state = _read_tab_state()
+    if _session_name and not state:
+        print("No tabs for current pw session.")
+        return
+    state = state or {}
+    target_win_id = state.get("window_id") if isinstance(state, dict) else None
+    target_tab = state.get("tab_index", -1) if isinstance(state, dict) else -1
+    target_sid = state.get("session_id", "") if isinstance(state, dict) else ""
+    raw = _jxa(f'''
+    var safari = Application("Safari");
+    if (!safari.running()) {{
+        JSON.stringify({{running: false, rows: []}});
+    }} else {{
+        var targetWinId = {json.dumps(target_win_id)};
+        var targetTab = {json.dumps(target_tab)};
+        var targetSid = {json.dumps(target_sid)};
+        var rows = [];
+        for (var w = 0; w < safari.windows.length; w++) {{
+            var win = safari.windows[w];
+            var winId = null;
+            try {{ winId = win.id(); }} catch(e) {{}}
+            if (targetWinId !== null && winId !== targetWinId) continue;
+            for (var t = 0; t < win.tabs.length; t++) {{
+                var title = "", url = "", sid = "";
+                try {{ title = win.tabs[t].name(); }} catch(e) {{}}
+                try {{ url = win.tabs[t].url(); }} catch(e) {{}}
+                try {{
+                    sid = safari.doJavaScript("window.__pw_session_id || ''", {{in: win.tabs[t]}});
+                }} catch(e) {{}}
+                var active = false;
+                if (targetSid && sid === targetSid) active = true;
+                else if (targetWinId !== null && winId === targetWinId && t === targetTab) active = true;
+                rows.push({{
+                    window_index: w,
+                    window_id: winId,
+                    tab_index: t,
+                    title: title,
+                    url: url,
+                    active: active
+                }});
+            }}
+        }}
+        JSON.stringify({{running: true, rows: rows, scoped: targetWinId !== null}});
+    }}
+    ''', timeout=10)
+    data = json.loads(raw) if raw else {"running": False, "rows": []}
+    if not data.get("running"):
+        print("Safari not running.")
+        return
+    rows = data.get("rows", [])
+    if not rows:
+        if target_win_id is not None:
+            print("No tabs for current pw session.")
+        else:
+            print("No Safari tabs.")
+        return
+    scoped = bool(data.get("scoped"))
+    for row in rows:
+        if scoped:
+            label = f"[{row.get('tab_index', 0)}]"
+        else:
+            label = f"[{row.get('window_index', 0)}:{row.get('tab_index', 0)}]"
+        marker = " *" if row.get("active") else ""
+        print(f"{label} {row.get('title', '')} | {row.get('url', '')}{marker}")
 
 
 def cmd_tab(index):
@@ -3473,8 +3739,25 @@ def cmd_importinfo_export(index_html, to_dir, limit=None, only=None,
         cmd_download("text=Confirm Download", to=dest, timeout=timeout)
 
 
-def cmd_close():
+def cmd_close(args=None):
+    args = list(args or [])
+    if args == ["--all"]:
+        safari_close_all()
+        return
+    if args:
+        raise PwError("usage: pw close [--all]")
     safari_close()
+
+
+def cmd_cleanup(args=None):
+    args = list(args or [])
+    stale_hours = PW_STALE_SESSION_HOURS
+    if args:
+        if len(args) != 2 or args[0] != "--stale-hours":
+            raise PwError("usage: pw cleanup [--stale-hours N]")
+        stale_hours = args[1]
+    closed = cleanup_stale_sessions(stale_hours, agent_only=False)
+    print(f"Closed {closed} stale pw window(s).")
 
 
 def cmd_status():
@@ -3843,7 +4126,8 @@ COMMANDS = {
     "tabs":       {"handler": lambda args: cmd_tabs(),                 "min_args": 0},
     "tab":        {"handler": lambda args: cmd_tab(args[0]),           "min_args": 1, "usage": "pw tab INDEX"},
     "back":       {"handler": _back_handler,                           "min_args": 0},
-    "close":      {"handler": lambda args: cmd_close(),                "min_args": 0},
+    "close":      {"handler": cmd_close,                               "min_args": 0, "usage": "pw close [--all]"},
+    "cleanup":    {"handler": cmd_cleanup,                            "min_args": 0, "usage": "pw cleanup [--stale-hours N]"},
     "status":     {"handler": lambda args: cmd_status(),               "min_args": 0},
     "doctor":     {"handler": lambda args: cmd_doctor(),               "min_args": 0},
     "batch":      {"handler": lambda args: cmd_batch(args),            "min_args": 1, "usage": "pw batch \"CMD1\" \"CMD2\" ..."},
@@ -3872,11 +4156,13 @@ def main():
     elif os.environ.get("PW_SESSION"):
         raw_session = os.environ["PW_SESSION"]
 
+    cmd_for_session = argv[0] if argv else None
+
     # Auto-session: when running inside Claude Code and no explicit session,
     # use a "claude" session so state files are distinct from manual CLI use.
     # Claude Code sets CLAUDECODE=1 (no underscore) — accept several variants
     # in case the entrypoint shape changes.
-    if raw_session is None and (
+    if raw_session is None and cmd_for_session != "cleanup" and (
         os.environ.get("CLAUDECODE")
         or os.environ.get("CLAUDE_CODE")
         or os.environ.get("CLAUDE_CODE_ENTRYPOINT")
@@ -3886,7 +4172,7 @@ def main():
     # Always operate inside a named session. Without this fallback, pw would
     # target safari.windows[0].tabs[0] — i.e., whatever tab the user has
     # frontmost — which is exactly the tab-hijacking we must never do.
-    if raw_session is None:
+    if raw_session is None and cmd_for_session not in {"close", "cleanup"}:
         raw_session = "default"
 
     if raw_session is not None:
@@ -3914,7 +4200,14 @@ def main():
         sys.exit(1)
 
     try:
+        # Every command opportunistically collects old agent-owned sessions.
+        # This is a crash backstop; the skill contract still requires an
+        # explicit close before the agent returns control to the user.
+        if cmd not in {"close", "cleanup", "tabs", "status", "doctor"}:
+            cleanup_stale_sessions(PW_STALE_SESSION_HOURS, agent_only=True)
         spec["handler"](args)
+        if cmd not in {"close", "cleanup", "tabs", "status", "doctor"}:
+            _touch_session_state()
     except PwError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

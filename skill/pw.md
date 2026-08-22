@@ -25,9 +25,11 @@ Run `pw` with no arguments to print the full command reference. Common commands:
 - `pw wait SELECTOR` — up to 10s
 - `pw batch "CMD1" "CMD2" ...` — multiple commands in one connection (faster)
 - `pw react-click SEL` / `pw react-set SEL PROP VALUE` — for MUI/React internals
-- `pw tabs` / `pw tab INDEX` / `pw back` / `pw close` / `pw status`
+- `pw tabs` / `pw tab INDEX` / `pw back` / `pw close` / `pw cleanup --stale-hours 12` / `pw status`
 
 Output flags on `nav`, `click`, `back`: `--links`, `--html`, `--quiet` (default auto-prints page text).
+
+For agent work, use a unique `codex-<task>-<timestamp>` session. Always run `pw close --name SESSION` before returning to the user, including error and blocked paths, then verify with `pw tabs --name SESSION`. Preserve a session only when the user explicitly requests it. Reserve `pw close --all` for a deliberate global reset when no other automation is active.
 
 ## Multi-agent sessions
 
